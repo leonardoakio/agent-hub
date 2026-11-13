@@ -113,21 +113,46 @@ $sysName = 'Windows'
 try { $sysName = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption -replace '^Microsoft ', '' } catch {}
 $sysArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 Ok "$sysName · $sysArch" 'o hub vai instalar e gravar tudo no padrão do Windows (%USERPROFILE%)'
-if (Has 'node') {
-  $major = 0
-  try { $major = [int](& node -p "process.versions.node.split('.')[0]") } catch {}
-  $nodeVersion = FirstLine { node --version }
-  if ($major -ge 18) { Ok 'node' "$nodeVersion - o hub e a interface (/ui)" }
-  else { Fail "node $nodeVersion" 'o hub precisa do Node.js 18 ou mais novo - https://nodejs.org'; exit 1 }
-} else {
-  Fail 'node não encontrado' 'o hub precisa do Node.js 18 ou mais novo - https://nodejs.org'
-  exit 1
+# Pergunta antes de instalar algo na máquina. Com HUB_YES=1 não pergunta.
+function Confirm([string]$q) {
+  if ($env:HUB_YES) { return $true }
+  $reply = Read-Host "    $q [S/n]"
+  return ($reply -eq '') -or ($reply -match '^[sSyY]')
 }
+# O winget grava o PATH novo no registro; este PowerShell ainda tem o antigo.
+function RefreshPath {
+  $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+  $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+  $env:Path = (@($machine, $user, $env:Path) | Where-Object { $_ }) -join ';'
+}
+function WingetInstall([string]$id) {
+  if (-not (Has 'winget')) { return $false }
+  & winget install --id $id -e --accept-source-agreements --accept-package-agreements
+  # já instalado numa versão antiga: o install recusa e o upgrade resolve
+  if ($LASTEXITCODE -ne 0) { & winget upgrade --id $id -e --accept-source-agreements --accept-package-agreements }
+  RefreshPath
+  return $true
+}
+function NodeMajor {
+  if (-not (Has 'node')) { return 0 }
+  try { return [int](& node -p "process.versions.node.split('.')[0]") } catch { return 0 }
+}
+$nodeNew = $false
+if ((NodeMajor) -lt 18) {
+  if (Has 'node') { Warn "node $(FirstLine { node --version })" 'antigo demais: o hub precisa do Node.js 18 ou mais novo' }
+  else { Warn 'node não encontrado' 'o hub precisa do Node.js 18 ou mais novo' }
+  if ((Has 'winget') -and (Confirm 'Instalar o Node.js LTS agora (winget)?')) { [void](WingetInstall 'OpenJS.NodeJS.LTS'); $nodeNew = $true }
+  if ((NodeMajor) -lt 18) { Fail 'sem Node.js 18+' 'instale em https://nodejs.org e rode de novo'; exit 1 }
+}
+Ok 'node' "$(FirstLine { node --version }) - o hub e a interface (/ui)"
 # npm.cmd: o npm.ps1 pode ser bloqueado pela política de execução
 if (Has 'npm.cmd') { Ok 'npm' "$(FirstLine { npm.cmd --version }) - instala e atualiza as CLIs" }
 else { Warn 'npm não encontrado' 'necessário para /install e /update' }
+if (-not (Has 'git')) {
+  Warn 'git não encontrado' 'sem ele o hub não se atualiza sozinho nem instala skills'
+  if ((Has 'winget') -and (Confirm 'Instalar o Git agora (winget)?')) { [void](WingetInstall 'Git.Git') }
+}
 if (Has 'git') { Ok 'git' "$((FirstLine { git --version }) -replace '^git version ', '') - atualizações do hub" }
-else { Warn 'git não encontrado' 'sem ele o hub não se atualiza sozinho' }
 if (Has 'aws') { Ok 'aws' "$(((FirstLine { aws --version }) -split ' ')[0]) - contas Bedrock" }
 else { Write-Host '  ' -NoNewline; Write-Host 'o' -ForegroundColor DarkGray -NoNewline; Write-Host ' aws ' -NoNewline; Write-Host 'opcional - só para contas Bedrock' -ForegroundColor DarkGray }
 
@@ -196,7 +221,7 @@ function Step([string]$cmd, [string]$what) {
   Write-Host " $what" -ForegroundColor DarkGray
   $script:step++
 }
-if ($pathChanged) { Step 'abra um terminal novo' '(o PATH mudou; neste aqui o hub já funciona)' }
+if ($pathChanged -or $nodeNew) { Step 'abra um terminal novo' '(o PATH mudou; neste aqui o hub já funciona)' }
 Step 'hub' 'abre o menu'
 Step '/ui' 'cadastra suas contas e credenciais'
 Step '/install' 'instala as CLIs das contas (sempre a versão mais recente)'

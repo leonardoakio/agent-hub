@@ -10,6 +10,22 @@ const crypto = require('crypto');
 const { execFile, spawn, spawnSync } = require('child_process');
 
 const HOME = os.homedir();
+
+// Progresso das operações demoradas da interface. O navegador manda um id no cabeçalho X-Hub-Op e consulta
+// /api/progress enquanto espera; aqui dentro, qualquer função chama progress() sem precisar receber o id
+// (ele acompanha a requisição pelo AsyncLocalStorage). No terminal não há id e progress() não faz nada.
+const { AsyncLocalStorage } = require('async_hooks');
+const opStore = new AsyncLocalStorage();
+const ops = new Map();
+// pct: onde a operação está (0-99). label: a etapa, em português. to: até onde esta etapa vai; enquanto ela
+// não termina, a barra da interface avança devagar de pct até to, sem nunca passar dali.
+function progress(pct, label, to) {
+  const op = ops.get(opStore.getStore());
+  if (!op) return;
+  op.pct = Math.max(op.pct, Math.min(99, Math.round(pct)));
+  op.to = Math.max(op.pct, to === undefined ? op.to : Math.min(99, Math.round(to)));
+  if (label) op.label = label;
+}
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
 const IS_WSL = !IS_WIN && (Boolean(process.env.WSL_DISTRO_NAME) || (() => { try { return /microsoft/i.test(fs.readFileSync('/proc/version', 'utf8')); } catch { return false; } })());
@@ -109,9 +125,12 @@ const API_VERSION = 1;
 const TYPES = ['claude', 'bedrock', 'codex', 'gemini', 'antigravity', 'copilot', 'custom'];
 // Meios pelos quais cada CLI pode ter sido instalada. O hub descobre qual foi usado olhando onde o
 // executável está e atualiza pelo mesmo meio, em vez de assumir npm para tudo.
-const PS1 = (line) => `powershell -NoProfile -ExecutionPolicy Bypass -Command "${line}"`;
+// TLS 1.2 explícito: o PowerShell 5.1 de Windows mais antigos ainda negocia TLS 1.0 e o download falha.
+const PS1 = (line) => `powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; ${line}"`;
 const INSTALL_WAYS = {
   claude: {
+    // o instalador oficial traz o próprio runtime: não depende da versão do Node da máquina (o pacote npm exige Node novo)
+    prefer: 'native',
     npm: '@anthropic-ai/claude-code',
     brew: { cask: 'claude-code' },
     native: { install: IS_WIN ? PS1('irm https://claude.ai/install.ps1 | iex') : 'curl -fsSL https://claude.ai/install.sh | bash', update: 'claude update' },
@@ -133,10 +152,11 @@ const METHOD_LABEL = {
 };
 const PKG_METHODS = ['npm', 'pnpm', 'yarn', 'bun'];
 // Instalação padrão para quem ainda não tem a CLI: npm continua sendo o primeiro, mas sem npm na máquina vale o instalador oficial.
-const DEFAULT_INSTALL = Object.fromEntries(Object.keys(INSTALL_WAYS).map((c) => [c, wayCmd(c, INSTALL_WAYS[c].npm ? 'npm' : 'native', 'install')]));
+const DEFAULT_INSTALL = Object.fromEntries(Object.keys(INSTALL_WAYS).map((c) => [c, wayCmd(c, INSTALL_WAYS[c].prefer || (INSTALL_WAYS[c].npm ? 'npm' : 'native'), 'install')]));
 // O agy se atualiza sozinho; rodar o script de novo não faz nada.
 const SELF_UPDATING = { agy: 'O Antigravity se atualiza sozinho em segundo plano ao ser usado.' };
-const NODE_MIN = { copilot: 22 };
+// Mantido vazio por compatibilidade: o Node mínimo de cada CLI agora vem do próprio pacote (engines.node), ver npmEngines.
+const NODE_MIN = {};
 
 // Comando que instala (verb = 'install') ou atualiza (verb = 'update') a CLI por um meio. Vazio quando o meio não tem comando.
 function wayCmd(cmd, method, verb) {
@@ -152,7 +172,8 @@ function wayCmd(cmd, method, verb) {
   if (!way) return '';
   if (method === 'brew') return way.cask ? `brew ${verb === 'update' ? 'upgrade' : 'install'} --cask ${way.cask}` : `brew ${verb === 'update' ? 'upgrade' : 'install'} ${way.formula}`;
   if (method === 'native') return (verb === 'update' && way.update) || way.install || '';
-  if (method === 'winget') return `winget ${verb === 'update' ? 'upgrade' : 'install'} --id ${way} -e`;
+  // sem os "accept" o winget para e pergunta sobre os termos: na interface isso travaria a instalação
+  if (method === 'winget') return `winget ${verb === 'update' ? 'upgrade' : 'install'} --id ${way} -e --accept-source-agreements --accept-package-agreements`;
   return '';
 }
 
@@ -186,9 +207,9 @@ function npmPrefix() {
   return npmPrefixCache;
 }
 // O npm global do sistema (/usr, /usr/local) costuma ser do root: aí o install -g só funciona com sudo ou mudando o prefixo.
-async function npmNeedsSudo() {
+async function npmNeedsSudo(ofPrefix) {
   if (IS_WIN) return false;
-  const prefix = await npmPrefix();
+  const prefix = ofPrefix || (await npmPrefix());
   if (!prefix) return false;
   const dir = npmModDir(prefix);
   const target = fs.existsSync(dir) ? dir : fs.existsSync(path.join(prefix, 'lib')) ? path.join(prefix, 'lib') : prefix;
@@ -212,40 +233,161 @@ async function installInfos(accounts) {
   return result;
 }
 
-// Decide como instalar ou atualizar uma conta: o campo install do config vale sempre; senão, o meio detectado;
-// senão, o meio padrão disponível na máquina. info pode vir pré-calculado (null = não instalada).
-async function resolveInstall(a, info) {
-  if (a.install) return { cmd: a.install, method: 'config', label: METHOD_LABEL.config, verb: 'install', needsSudo: false, note: '' };
+// "engines.node" de um pacote: >=22.0.0, ^20.19.0 || >=22.12.0, 20.x… Na dúvida devolve true (não bloqueia).
+function nodeSatisfies(range, version = process.versions.node) {
+  const v = String(version).replace(/^v/, '').split('.').map((x) => parseInt(x, 10) || 0);
+  const cmp = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+  const one = (c) => {
+    const m = c.match(/^(>=|<=|>|<|=|\^|~)?v?([0-9xX*]+(?:\.[0-9xX*]+){0,2})/);
+    if (!m) return true;
+    const raw = m[2].split('.');
+    const p = [0, 1, 2].map((k) => (raw[k] === undefined || /^[xX*]$/.test(raw[k]) ? null : parseInt(raw[k], 10)));
+    if (p[0] === null) return true;
+    const lo = p.map((x) => x ?? 0);
+    switch (m[1] || (p.includes(null) ? 'x' : '=')) {
+      case '>=': return cmp(v, lo) >= 0;
+      case '>': return p[1] === null ? v[0] > lo[0] : p[2] === null ? v[0] > lo[0] || (v[0] === lo[0] && v[1] > lo[1]) : cmp(v, lo) > 0;
+      case '<=': return p[1] === null ? v[0] <= lo[0] : p[2] === null ? v[0] < lo[0] || (v[0] === lo[0] && v[1] <= lo[1]) : cmp(v, lo) <= 0;
+      case '<': return cmp(v, lo) < 0;
+      case '=': return cmp(v, lo) === 0;
+      case '^': return cmp(v, lo) >= 0 && v[0] === lo[0];
+      case '~': return cmp(v, lo) >= 0 && v[0] === lo[0] && (p[1] === null || v[1] === lo[1]);
+      default: return v[0] === p[0] && (p[1] === null || v[1] === p[1]);
+    }
+  };
+  try {
+    return String(range || '').split('||').some((set) => set.trim().replace(/(>=|<=|>|<|=|\^|~)\s+/g, '$1').split(/\s+/).filter(Boolean).every(one));
+  } catch { return true; }
+}
+
+// Node exigido pela versão mais recente de um pacote npm, consultado no registro (e guardado por 12 h).
+// Uma tabela fixa no código envelhece: o claude-code passou a exigir Node 22 e o copilot deixou de exigir.
+const enginesCache = new Map();
+function npmEngines(pkg) {
+  if (enginesCache.has(pkg)) return enginesCache.get(pkg);
+  const file = path.join(path.dirname(CONFIG), 'engines.json');
+  const job = (async () => {
+    const disk = readJson(file) || {};
+    const hit = isObj(disk[pkg]) ? disk[pkg] : null;
+    if (hit && Date.now() - hit.at < 12 * 3600 * 1000) return String(hit.node || '');
+    const r = await run('npm', ['view', `${pkg}@latest`, 'engines.node', '--fetch-retries=0', '--fetch-timeout=8000'], 15000);
+    if (!r.ok) {
+      // sem rede: vale o último valor conhecido, e tenta de novo daqui a pouco
+      setTimeout(() => enginesCache.delete(pkg), 60000).unref();
+      return hit ? String(hit.node || '') : '';
+    }
+    const node = r.stdout.trim().split('\n')[0];
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(file, JSON.stringify({ ...disk, [pkg]: { node, at: Date.now() } }));
+    } catch {}
+    return node;
+  })().catch(() => '');
+  enginesCache.set(pkg, job);
+  return job;
+}
+// Como subir o Node nesta máquina, pelo gerenciador que a pessoa já usa.
+function nodeFix(range) {
+  const n = (String(range).match(/(\d+)/) || [])[1] || '22';
+  const exe = process.execPath.replace(/\\/g, '/');
+  if (process.env.NVM_DIR || /\/\.nvm\//.test(exe)) return `Atualize o Node: nvm install ${n} && nvm alias default ${n}, e abra um terminal novo`;
+  if (/\/\.?fnm\//.test(exe) || process.env.FNM_DIR) return `Atualize o Node: fnm install ${n} && fnm default ${n}, e abra um terminal novo`;
+  if (/\/\.volta\//.test(exe)) return `Atualize o Node: volta install node@${n}`;
+  if (/\/(Cellar|homebrew|linuxbrew)\//.test(exe)) return 'Atualize o Node: brew upgrade node';
+  if (IS_WIN) return `Atualize o Node: winget upgrade OpenJS.NodeJS.LTS (ou baixe o Node ${n}+ em https://nodejs.org)`;
+  return `Atualize o Node.js para ${range}: https://nodejs.org (ou com nvm: nvm install ${n})`;
+}
+// Prefixo do npm onde uma CLI já instalada mora: a atualização tem de ir para o mesmo lugar.
+function npmPrefixOf(info) {
+  const real = String(info.real || '').replace(/\\/g, '/');
+  if (IS_WIN) {
+    const m = real.match(/^(.*)\/node_modules\//);
+    return m ? path.normalize(m[1]) : path.dirname(info.path);
+  }
+  const m = real.match(/^(.*)\/lib\/node_modules\//);
+  return m ? m[1] : '';
+}
+const methodReady = async (m) => (m === 'native' ? (IS_WIN ? which('powershell') : true) : which(m));
+
+// Plano de instalação/atualização: as tentativas possíveis nesta máquina, na ordem. O campo install do config vale
+// sempre; CLI já instalada atualiza pelo mesmo meio; CLI nova tenta os meios disponíveis, pulando os que não servem
+// (npm sem o Node que o pacote exige, npm global do root…). info pode vir pré-calculado (null = não instalada).
+async function installPlan(a, info) {
+  const base = { cmd: '', method: '', label: '', verb: 'install', needsSudo: false, note: '', path: '' };
+  if (a.install) return { attempts: [{ ...base, cmd: a.install, method: 'config', label: METHOD_LABEL.config }], none: base };
   const ways = INSTALL_WAYS[a.command];
-  if (!ways) return { cmd: '', method: '', label: '', verb: 'install', needsSudo: false, note: `sem instalador conhecido para ${a.command}: defina install = … no config` };
+  if (!ways) return { attempts: [], none: { ...base, note: `sem instalador conhecido para ${a.command}: defina install = … no config` } };
   if (info === undefined) info = await installInfo(a.command);
-  const res = { cmd: '', method: '', label: '', verb: info ? 'update' : 'install', needsSudo: false, note: '', path: info ? info.path : '' };
+  const mk = (method, verb) => ({ ...base, method, label: METHOD_LABEL[method] || method, verb, cmd: wayCmd(a.command, method, verb), path: info ? info.path : '' });
+  const withPrefix = (cmd, prefix) => cmd.replace('npm install -g ', `npm install -g --prefix "${prefix}" `);
+  const hasNpm = Boolean(ways.npm) && (await which('npm'));
+  const engines = hasNpm ? await npmEngines(ways.npm) : '';
+  const nodeBad = Boolean(engines) && !nodeSatisfies(engines);
+  const nodeWhy = nodeBad ? `o pacote ${ways.npm} agora exige Node.js ${engines} (este é o v${process.versions.node})` : '';
+  const alternatives = async () => {
+    const r = [];
+    for (const m of ['native', 'brew', 'winget']) if (ways[m] && wayCmd(a.command, m, 'install') && (await methodReady(m))) r.push(m);
+    return r;
+  };
+
   if (!info) {
-    // npm primeiro; mas se o npm global for do root e houver outro meio na máquina, ele passa a ser a última opção
-    const order = [['npm', 'npm'], ['native', IS_WIN ? 'powershell' : 'curl'], ['brew', 'brew'], ['winget', 'winget']];
-    if (ways.npm && (await npmNeedsSudo())) order.push(order.shift());
-    let pick = '';
-    for (const [m, tool] of order) if (ways[m] && (await which(tool))) { pick = m; break; }
-    if (!pick) pick = ways.npm ? 'npm' : 'native';
-    res.method = pick;
-    res.cmd = wayCmd(a.command, pick, 'install');
-  } else {
-    res.method = info.method;
-    res.cmd = wayCmd(a.command, info.method, 'update');
-    if (!res.cmd) {
-      const site = typeof ways.binary === 'string' ? ways.binary : '';
-      res.note = info.method === 'binary'
-        ? `instalada como binário avulso em ${homeRel(info.path)}: baixe a versão nova${site ? ` em ${site}` : ''} e substitua o arquivo`
-        : `instalada via ${METHOD_LABEL[info.method] || info.method} em ${homeRel(info.path)}: atualize por lá ou defina install = … no config`;
+    let order = ['npm', 'native', 'brew', 'winget'];
+    if (ways.prefer) order = [ways.prefer, ...order.filter((m) => m !== ways.prefer)];
+    const attempts = [];
+    const why = [];
+    let rootNpm = null;
+    for (const m of order) {
+      if (!ways[m] || !wayCmd(a.command, m, 'install')) continue;
+      if (!(await methodReady(m))) { if (m === 'npm') why.push('npm não encontrado (vem com o Node.js: https://nodejs.org)'); continue; }
+      if (m === 'npm') {
+        if (nodeBad) { why.push(nodeWhy); continue; }
+        if (await npmNeedsSudo()) { rootNpm = mk('npm', 'install'); continue; }
+      }
+      attempts.push(mk(m, 'install'));
+    }
+    if (rootNpm) {
+      // npm global do root (Node do apt, por exemplo): em vez de sudo, instala na pasta do usuário, que já está no PATH do hub
+      const local = path.join(HOME, '.local');
+      attempts.push({ ...rootNpm, cmd: withPrefix(rootNpm.cmd, local), note: `o npm global (${await npmPrefix()}) é do root: instalo em ${homeRel(local)}, sem sudo` });
+    }
+    if (nodeBad && attempts.length && !attempts[0].note) attempts[0].note = `${nodeWhy}: uso ${attempts[0].label}`;
+    const none = { ...base, method: ways.npm ? 'npm' : 'native', note: `não há como instalar ${a.command} nesta máquina agora: ${why.join('; ') || 'nenhum instalador disponível'}${nodeBad ? `. ${nodeFix(engines)}` : ''}` };
+    none.label = METHOD_LABEL[none.method];
+    return { attempts, none };
+  }
+
+  const att = mk(info.method, 'update');
+  const none = { ...att, cmd: '' };
+  if (info.method === 'npm' && att.cmd) {
+    const def = await npmPrefix();
+    const own = npmPrefixOf(info);
+    const custom = Boolean(own && def && samePath(own) !== samePath(def));
+    if (custom) att.cmd = withPrefix(att.cmd, own);
+    if (nodeBad) {
+      // o pacote novo não roda neste Node: em vez de quebrar a CLI, migra para um meio que traz o próprio runtime
+      const alt = (await alternatives())[0];
+      if (!alt) return { attempts: [], none: { ...none, note: `${nodeWhy}. ${nodeFix(engines)}` } };
+      return { attempts: [{ ...mk(alt, 'install'), verb: 'update', migrateFrom: { method: 'npm', pkg: ways.npm, prefix: own || def }, note: `${nodeWhy}: migro para ${METHOD_LABEL[alt]}` }], none };
+    }
+    if (await npmNeedsSudo(custom ? own : undefined)) {
+      att.needsSudo = true;
+      att.cmd = `sudo ${att.cmd}`;
+      att.note = `o npm global (${custom ? own : def}) é do root: precisa de sudo, ${NPM_PREFIX_HINT}`;
     }
   }
-  res.label = METHOD_LABEL[res.method] || res.method;
-  if (res.method === 'npm' && res.cmd && (await npmNeedsSudo())) {
-    res.needsSudo = true;
-    res.cmd = `sudo ${res.cmd}`;
-    res.note = `o npm global (${await npmPrefix()}) é do root: precisa de sudo, ${NPM_PREFIX_HINT}`;
+  if (!att.cmd) {
+    const site = typeof ways.binary === 'string' ? ways.binary : '';
+    none.note = info.method === 'binary'
+      ? `instalada como binário avulso em ${homeRel(info.path)}: baixe a versão nova${site ? ` em ${site}` : ''} e substitua o arquivo`
+      : `instalada via ${METHOD_LABEL[info.method] || info.method} em ${homeRel(info.path)}: atualize por lá ou defina install = … no config`;
+    return { attempts: [], none };
   }
-  return res;
+  return { attempts: [att], none };
+}
+// A primeira tentativa do plano (ou o motivo de não haver nenhuma): é o que a interface e o menu mostram.
+async function resolveInstall(a, info) {
+  const plan = await installPlan(a, info);
+  return plan.attempts[0] || plan.none;
 }
 // Compatibilidade: comando "estático" (config ou padrão), sem olhar a máquina.
 const installCmd = (a) => a.install || DEFAULT_INSTALL[a.command] || '';
@@ -737,6 +879,7 @@ async function fetchSource(src, { fresh = false } = {}) {
   if (!fresh && cached && Date.now() - cached.at < 10 * 60 * 1000 && fs.existsSync(cached.dir)) return { label, ...filterSub(cached, sub) };
   if (cached) { retireSource(cached); sourceCache.delete(key); }
   if (!(await which('git'))) throw new Error(`git não está instalado: as skills vêm do GitHub por ele (${IS_WIN ? 'winget install --id Git.Git -e' : IS_MAC ? 'xcode-select --install' : 'sudo apt install git'})`);
+  progress(8, `Baixando ${label} do GitHub`, 46);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-skill-'));
   const r = await run('git', ['clone', '--depth', '1', '--quiet', ...(branch ? ['--branch', branch] : []), url, dir], 120000,
     { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_ASKPASS: 'true' });
@@ -747,6 +890,7 @@ async function fetchSource(src, { fresh = false } = {}) {
         : r.code === null || /timed out/i.test(String(r.code)) ? 'demorou demais (rede lenta?)' : r.stderr.split('\n').filter(Boolean).pop();
     throw new Error(`não consegui baixar ${label}${branch ? ` (${branch})` : ''}: ${why || 'repositório não encontrado'}`);
   }
+  progress(48, 'Lendo as skills do repositório', 54);
   const skills = [];
   const walk = (d, depth) => {
     if (depth > 4) return;
@@ -1147,6 +1291,7 @@ async function checkDeps(folders, opts = {}) {
 }
 
 async function installDeps(folders, includeOptional = false, opts = {}) {
+  progress(4, 'Conferindo o que falta', 12);
   const before = await checkDeps(folders, opts);
   const want = before.deps.filter((d) => !d.ok && (includeOptional || !d.optional));
   const pip = before.hasPip ? [...new Set(want.filter((d) => d.how === 'pip').map((d) => d.pip))].filter((x) => DEP_NAME_RE.test(x)) : [];
@@ -1155,12 +1300,18 @@ async function installDeps(folders, includeOptional = false, opts = {}) {
   const casks = [...new Set(want.filter((d) => d.how === 'brew' && d.brewCask).map((d) => d.brew))].filter((x) => DEP_NAME_RE.test(x));
   const log = [];
   const tail = (r, fallback) => r.stderr.split('\n').filter(Boolean).pop() || fallback;
+  // uma fatia da barra para cada gerenciador que tem algo a instalar
+  const stages = [brew, casks, pip, npm].filter((l) => l.length).length || 1;
+  let stage = 0;
+  const stageOf = (what, list) => { progress(12 + (80 * stage) / stages, `${what}: instalando ${list.join(', ')}`, 12 + (80 * ++stage) / stages); };
   for (const [list, args, what] of [[brew, ['install'], 'Homebrew'], [casks, ['install', '--cask'], 'Homebrew (apps)']]) {
     if (!list.length) continue;
+    stageOf(what, list);
     const r = await run('brew', [...args, ...list], 30 * 60 * 1000, { HOMEBREW_NO_AUTO_UPDATE: '1' });
     log.push(r.ok ? `${what}: ${list.join(', ')} instalados` : `${what}: falhou (${tail(r, 'brew indisponível')})`);
   }
   if (pip.length) {
+    stageOf('Python (pip)', pip);
     const venv = (await pyRun(['-c', 'import sys; sys.exit(sys.prefix == sys.base_prefix)'], 10000)).ok;
     let r = await pyRun(['-m', 'pip', 'install', ...(venv ? [] : ['--user']), '--quiet', ...pip], 10 * 60 * 1000);
     // PEP 668: Python do sistema recusa pip --user sem esta flag.
@@ -1171,6 +1322,7 @@ async function installDeps(folders, includeOptional = false, opts = {}) {
     log.push(r.ok ? `Python: ${pip.join(', ')} instalados` : `Python: falhou (${r.stderr.split('\n').filter(Boolean).pop() || 'pip indisponível'})`);
   }
   if (npm.length) {
+    stageOf('Node (npm)', npm);
     const r = await run('npm', ['install', '-g', '--silent', ...npm], 10 * 60 * 1000);
     const last = r.stderr.split('\n').filter(Boolean).pop() || 'npm indisponível';
     log.push(r.ok ? `Node: ${npm.join(', ')} instalados` : `Node: falhou (${/EACCES|EPERM/.test(r.stderr) ? `sem permissão no npm global: rode no terminal sudo npm install -g ${npm.join(' ')}` : last})`);
@@ -1286,6 +1438,7 @@ async function updateSkill(body) {
   const src = await fetchSource(sourceArg, { fresh: true });
   const sk = src.skills.find((x) => x.folder === folder);
   if (!sk) throw new Error(`não encontrei a skill "${folder}" em ${src.label}`);
+  progress(60, `Comparando ${folder} com a versão nova`, 95);
   const relPath = path.relative(src.dir, sk.dir);
   // Skills do npx skills já têm a origem no lock; não gravamos nada dentro delas.
   let npxDir = readSkillLock().skills?.[folder] ? path.join(HOME, '.agents', 'skills') : null;
@@ -1331,9 +1484,14 @@ async function installSkills(body) {
   if (!targets.length) throw new Error('escolha pelo menos um agente');
   const chosen = src.skills.filter((sk) => wanted.has(sk.folder));
   if (!chosen.length) throw new Error('escolha pelo menos uma skill');
+  let done = 0;
   for (const sk of chosen) {
     if (!SKILL_NAME_RE.test(sk.folder)) throw new Error(`nome de skill inválido: ${sk.folder}`);
     for (const t of targets) {
+      const total = chosen.length * targets.length;
+      progress(55 + (40 * done) / total, `Instalando ${sk.folder} em ${t.display} (${done + 1} de ${total})`, 55 + (40 * ++done) / total);
+      // a cópia é síncrona: cede a vez para a interface conseguir ler o progresso
+      await new Promise((res) => setImmediate(res));
       replaceSkillDir(sk.dir, path.join(t.dir, sk.folder), `${src.label}\n${src.commit} · ${src.date}\n`, true);
     }
   }
@@ -1372,30 +1530,271 @@ function removeSkill(body) {
 
 const asList = (v) => (Array.isArray(v) ? v : []);
 
+// Uma instalação do npm interrompida deixa a pasta temporária ".<pacote>-XXXXXXXX" ao lado do pacote
+// (ex.: @anthropic-ai/.claude-code-8TMF6W1j) e o próximo install -g falha com ENOTEMPTY no rename.
+// Pacotes de um comando "npm install -g …", sem a versão.
+function npmPkgsOf(cmd) {
+  const m = String(cmd || '').match(/^(?:sudo\s+)?npm\s+(?:install|i|add)\s+((?:-\S+\s+)*)(.*)$/);
+  if (!m || !/(^|\s)(-g|--global)(\s|$)/.test(m[1] + ' ' + m[2])) return [];
+  return m[2].split(/\s+/).filter((x) => x && !x.startsWith('-'))
+    .map((x) => x.replace(/(.)@[^/@]*$/, '$1'))
+    .filter((x) => /^(@[a-z0-9._~-]+\/)?[a-z0-9._~-]+$/i.test(x));
+}
+// Apaga as sobras do npm para esses pacotes no npm global. Devolve o que foi apagado.
+// withPkg: 'force' também apaga a pasta do pacote (meio instalada), que o npm reinstala em seguida;
+// 'stale' só a apaga se havia sobra, sinal de que a falha foi esse bug e não, por exemplo, a rede.
+async function npmCleanLeftovers(cmd, withPkg = '') {
+  const pkgs = npmPkgsOf(cmd);
+  if (!pkgs.length) return [];
+  const own = String(cmd).match(/--prefix[= ]"([^"]+)"/);
+  const prefix = own ? own[1] : await npmPrefix();
+  if (!prefix) return [];
+  const root = npmModDir(prefix);
+  const removed = [];
+  for (const pkg of pkgs) {
+    const dir = path.join(root, ...pkg.split('/'));
+    const parent = path.dirname(dir);
+    const base = path.basename(dir);
+    const stale = new RegExp(`^\\.${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-[A-Za-z0-9]{8}$`);
+    let found = [];
+    try { found = fs.readdirSync(parent).filter((f) => stale.test(f)).map((f) => path.join(parent, f)); } catch {}
+    if ((withPkg === 'force' || (withPkg === 'stale' && found.length)) && fs.existsSync(dir)) found.push(dir);
+    for (const f of found) {
+      try { fs.rmSync(f, { recursive: true, force: true }); removed.push(f); } catch {}
+    }
+  }
+  return removed;
+}
+const NPM_ENOTEMPTY = /ENOTEMPTY|code ENOTEMPTY|errno -39|directory not empty, rename/;
+
+// ---------- Motor de instalação: o mesmo para a interface e para o terminal ----------
+
+// Pastas onde as CLIs costumam cair e que nem sempre estão no PATH de quem abriu o hub (terminal antigo, serviço, IDE).
+function knownBinDirs() {
+  if (IS_WIN) {
+    const local = process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local');
+    const roaming = process.env.APPDATA || path.join(HOME, 'AppData', 'Roaming');
+    return [path.join(HOME, '.local', 'bin'), path.join(local, 'Microsoft', 'WinGet', 'Links'), path.join(roaming, 'npm')];
+  }
+  return [path.join(HOME, '.local', 'bin'), ...(IS_MAC ? ['/opt/homebrew/bin'] : ['/home/linuxbrew/.linuxbrew/bin']), '/usr/local/bin'];
+}
+// Acrescenta ao fim do PATH deste processo (nunca na frente: não muda qual executável já vinha primeiro).
+function addToPath(dirs) {
+  const key = (d) => { const r = path.resolve(d); return IS_WIN ? r.toLowerCase().replace(/\\+$/, '') : r; };
+  const cur = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  const seen = new Set(cur.map(key));
+  for (const d of dirs) {
+    if (!d || winSide(d) || seen.has(key(d))) continue;
+    try { if (!fs.statSync(d).isDirectory()) continue; } catch { continue; }
+    cur.push(d);
+    seen.add(key(d));
+  }
+  process.env.PATH = cur.join(path.delimiter);
+}
+addToPath(knownBinDirs());
+// Depois de instalar: enxerga na hora o que o instalador acabou de pôr no PATH, sem pedir "abra um terminal novo".
+async function refreshPath() {
+  const dirs = knownBinDirs();
+  const prefix = await npmPrefix();
+  if (prefix) dirs.push(npmBinDir(prefix));
+  if (IS_WIN) {
+    // winget e instaladores gravam o PATH no registro; este processo ainda tem o antigo
+    const r = await run('powershell', ['-NoProfile', '-Command', "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')"], 10000);
+    if (r.ok) dirs.push(...r.stdout.split(';').map((x) => x.trim()).filter(Boolean));
+  }
+  addToPath(dirs);
+}
+
+const isMusl = () => {
+  if (IS_WIN || IS_MAC) return false;
+  try { return fs.existsSync('/etc/alpine-release') || fs.readdirSync('/lib').some((f) => /^ld-musl-/.test(f)); } catch { return false; }
+};
+// O que falta no sistema para este meio de instalação funcionar, e a linha que instala. interactive = dá para digitar a senha do sudo.
+async function ensurePrereqs(command, how, { exec, say, interactive }) {
+  if (IS_WIN) return { ok: true };
+  const need = [];
+  if (how.method === 'native') {
+    if (!(await which('bash'))) need.push('bash');
+    if (!(await which('curl')) && !(await which('wget'))) need.push('curl');
+  }
+  // binário do Claude em Alpine/musl: sem estas bibliotecas ele instala e não abre
+  if (command === 'claude' && how.method !== 'brew' && isMusl() && (await which('apk'))) {
+    for (const lib of ['libgcc', 'libstdc++', 'ripgrep']) if (!(await run('apk', ['info', '-e', lib], 8000)).ok) need.push(lib);
+  }
+  if (!need.length) return { ok: true };
+  const missing = need.join(', ');
+  let line = '';
+  if (IS_MAC) line = (await which('brew')) ? `brew install ${need.join(' ')}` : '';
+  else {
+    const pm = await systemPm();
+    const root = typeof process.getuid === 'function' && process.getuid() === 0;
+    if (pm && (root || (await which('sudo')))) line = `${root ? '' : interactive ? 'sudo ' : 'sudo -n '}${pm.args(need).join(' ')}`;
+  }
+  if (!line) return { ok: false, error: `faltam no sistema: ${missing}. Instale e tente de novo.` };
+  say(`faltam no sistema: ${missing}. Instalando: ${line}`, 'warn');
+  progress(13, `Instalando o que faltava no sistema: ${missing}`, 16);
+  const r = await exec(line);
+  if (r.ok) return { ok: true };
+  return { ok: false, error: `faltam no sistema: ${missing}, e não consegui instalar sozinho${interactive ? '' : ' (precisa da senha do sudo)'}. Rode no terminal: ${line.replace('sudo -n ', 'sudo ')}` };
+}
+
+const outputOf = (r) => `${r.stdout || ''}\n${r.stderr || ''}`;
+// winget devolve erro quando não há versão nova ou o pacote já está instalado: para o hub isso é sucesso.
+const WINGET_NOOP = /No applicable (update|upgrade) found|No available upgrade found|No newer package versions are available|already installed|Nenhuma atualização (aplicável|disponível)|já está instalado/i;
+const wingetNoop = (how, r) => how.method === 'winget' && ([2316632107, -1978335189, 2316632161, -1978335135].includes(r.code) || WINGET_NOOP.test(outputOf(r)));
+const NET_FAIL = /ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ESOCKETTIMEDOUT|ERR_SOCKET_TIMEOUT|socket hang up|network (timeout|request)|curl: \((5|6|7|18|28|35|52|55|56)\)|Could not resolve host|Temporary failure in name resolution/i;
+
+// Falhas que têm conserto conhecido: devolve o que fazer antes de tentar de novo (ou null). used evita repetir o mesmo conserto.
+async function repairFor(how, cmd, out, used) {
+  const isNpm = npmPkgsOf(cmd).length > 0;
+  const once = (kind) => (used.has(kind) ? false : (used.add(kind), true));
+  if (isNpm && NPM_ENOTEMPTY.test(out) && once('notempty')) {
+    const gone = await npmCleanLeftovers(cmd, 'force');
+    if (gone.length) return { msg: `o npm deixou uma instalação pela metade: apaguei ${gone.map(homeRel).join(', ')} e tento de novo` };
+  }
+  if (isNpm && /\bEEXIST\b/.test(out) && !/--force/.test(cmd) && once('eexist')) {
+    return { cmd: `${cmd} --force`, msg: 'já existia um arquivo no lugar do executável: tento de novo com --force' };
+  }
+  if (isNpm && /EINTEGRITY|EBADSIZE|Z_DATA_ERROR|Z_BUF_ERROR|Unexpected end of JSON input|integrity checksum failed|cache.*corrupt/i.test(out) && once('cache')) {
+    await run('npm', ['cache', 'clean', '--force'], 120000);
+    return { msg: 'o cache do npm estava corrompido: limpei e tento de novo' };
+  }
+  if (how.method === 'brew' && /Another active Homebrew .*process is already in progress/i.test(out) && once('brewlock')) {
+    await new Promise((res) => setTimeout(res, 8000));
+    return { msg: 'o Homebrew estava ocupado com outra operação: esperei e tento de novo' };
+  }
+  if (NET_FAIL.test(out) && once('net')) {
+    await new Promise((res) => setTimeout(res, 3000));
+    return { msg: 'a rede falhou no meio do download: tento de novo' };
+  }
+  return null;
+}
+// Dica para as falhas que o hub não conserta sozinho.
+function failureHint(how, out) {
+  if (/EACCES|EPERM|permission denied/i.test(out)) return ` Sem permissão de escrita: rode no terminal com sudo (${how.cmd.replace(/^sudo /, '')}) ${NPM_PREFIX_HINT}.`;
+  if (/ENOSPC|No space left on device/i.test(out)) return ' O disco está cheio: libere espaço e tente de novo.';
+  if (/SELF_SIGNED_CERT|UNABLE_TO_(GET_ISSUER_CERT|VERIFY_LEAF_SIGNATURE)|CERT_HAS_EXPIRED|certificate (verify failed|problem)/i.test(out)) return ' O certificado da rede foi recusado (comum com proxy corporativo): configure-o com npm config set cafile <arquivo.pem> ou a variável NODE_EXTRA_CA_CERTS.';
+  if (NET_FAIL.test(out)) return ' Sem conexão com o servidor: confira a internet, o proxy ou a VPN.';
+  if (/\bE404\b|404 Not Found/.test(out)) return ' O pacote não foi encontrado no registro configurado: confira com npm config get registry.';
+  if (NPM_ENOTEMPTY.test(out)) {
+    const dirs = npmPkgsOf(how.cmd).map((p) => `$(npm root -g)/${p}`);
+    if (dirs.length) return ` Sobrou uma instalação interrompida do npm: rode no terminal rm -rf ${dirs.map((d) => `${d} ${d.replace(/([^/]+)$/, '.$1-*')}`).join(' ')} e tente de novo.`;
+  }
+  return '';
+}
+
+async function runAttempt(how, { exec, say }) {
+  let cmd = how.cmd;
+  // sem curl mas com wget: mesmo instalador, outro jeito de baixar
+  const viaCurl = cmd.match(/^curl -fsSL (\S+) \| bash$/);
+  if (viaCurl && !IS_WIN && !(await which('curl')) && (await which('wget'))) cmd = `wget -qO- ${viaCurl[1]} | bash`;
+  if (npmPkgsOf(cmd).length) {
+    const pre = await npmCleanLeftovers(cmd);
+    if (pre.length) say(`removi sobra de uma instalação interrompida do npm: ${pre.map(homeRel).join(', ')}`, 'info');
+  }
+  say(cmd, 'cmd');
+  const used = new Set();
+  let r = await exec(cmd);
+  while (!r.ok && !wingetNoop(how, r)) {
+    const fix = await repairFor(how, cmd, outputOf(r), used);
+    if (!fix) break;
+    say(fix.msg, 'warn');
+    progress(0, `${fix.msg[0].toUpperCase()}${fix.msg.slice(1)}`);
+    cmd = fix.cmd || cmd;
+    r = await exec(cmd);
+  }
+  if (r.ok || wingetNoop(how, r)) return { ok: true, cmd };
+  const out = outputOf(r);
+  // eslint-disable-next-line no-control-regex
+  const tail = out.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim().split('\n').slice(-8).join('\n');
+  return { ok: false, cmd, tail, hint: failureHint(how, out) };
+}
+
+// Por que um executável recém-instalado não abre, em português.
+function runtimeWhy(out) {
+  let m;
+  if ((m = out.match(/version `?(GLIBC(?:XX)?_[\d.]+)'? not found/))) return `a glibc deste sistema é antiga demais para o binário (ele pede ${m[1]}): atualize a distribuição`;
+  if ((m = out.match(/error while loading shared libraries: (\S+?):/))) return `falta a biblioteca ${m[1]} no sistema`;
+  if (/Exec format error|cannot execute binary file|Bad CPU type/i.test(out)) return 'o binário é de outra arquitetura de processador';
+  if (/SyntaxError|Unsupported engine|ERR_REQUIRE_ESM|requires? Node(\.js)? /i.test(out)) return `ele precisa de um Node.js mais novo (este é o v${process.versions.node})`;
+  if (isMusl() && /not found|No such file or directory/i.test(out)) return 'o binário não é compatível com este sistema (musl/Alpine): faltam libgcc e libstdc++';
+  return '';
+}
+// A instalação só conta se o executável aparece no PATH e abre. Numa migração, confere o executável novo, não o antigo.
+async function verifyInstall(command, how) {
+  await refreshPath();
+  const all = await whichAll(command);
+  const exe = how.migrateFrom ? all.find((x) => classifyInstall(command, x).method !== how.migrateFrom.method) : all[0];
+  if (!exe) {
+    const dir = how.method === 'native' ? homeRel(path.join(HOME, '.local', 'bin')) : how.method === 'npm' ? homeRel(npmBinDir((await npmPrefix()) || '')) : '';
+    return { ok: false, error: `o instalador (${how.label}) terminou, mas o comando ${command} não apareceu no PATH${dir ? ` (procure em ${dir})` : ''}: abra um terminal novo e abra o hub de novo.` };
+  }
+  if (how.method === 'config' || !INSTALL_WAYS[command]) return { ok: true, exe };
+  const r = await run(exe, ['--version'], 30000);
+  const why = r.ok ? '' : runtimeWhy(outputOf(r));
+  // só reprova por motivo conhecido: um --version que falha por outra razão não prova instalação quebrada
+  if (why) return { ok: false, error: `${command} foi instalado via ${how.label} em ${homeRel(exe)}, mas não abre: ${why}.` };
+  return { ok: true, exe };
+}
+// Migração concluída: tira a instalação antiga do npm para ela não continuar na frente no PATH.
+async function finishMigration(command, how, { exec, say, interactive }) {
+  const from = how.migrateFrom;
+  const prefix = from.prefix || '';
+  const def = await npmPrefix();
+  const sudo = (await npmNeedsSudo(prefix || undefined)) ? (interactive ? 'sudo ' : null) : '';
+  const line = `npm uninstall -g ${prefix && def && samePath(prefix) !== samePath(def) ? `--prefix "${prefix}" ` : ''}${from.pkg}`;
+  if (sudo === null) return say(`a instalação antiga do npm continua na máquina: remova com sudo ${line}`, 'warn');
+  say(`removendo a instalação antiga do npm: ${line}`, 'info');
+  const r = await exec(`${sudo}${line}`);
+  if (!r.ok) say(`não consegui remover a instalação antiga do npm: rode ${line}`, 'warn');
+  const first = (await whichAll(command))[0];
+  if (first && classifyInstall(command, first).method === from.method) say(`a instalação antiga (${homeRel(first)}) ainda vem primeiro no PATH`, 'warn');
+}
+
+// Instala ou atualiza a CLI de uma conta, consertando sozinho o que tem conserto. Nunca lança: devolve { ok, how, error }.
+//   exec(linha) -> { ok, code, stdout, stderr }   say(texto, 'cmd' | 'info' | 'warn')   interactive: há terminal para a senha do sudo
+async function performInstall(account, opts = {}) {
+  const verb = opts.verb || 'instalar';
+  const ctx = { exec: opts.exec || ((line) => runShell(line, 10 * 60 * 1000)), say: opts.say || (() => {}), interactive: Boolean(opts.interactive) };
+  progress(3, 'Verificando como instalar nesta máquina', 12);
+  const info = opts.info !== undefined ? opts.info : await installInfo(account.command);
+  const plan = await installPlan(account, info);
+  if (!plan.attempts.length) { const error = plan.none.note || `não há comando de instalação para "${account.command}"`; return { ok: false, how: plan.none, error, brief: error }; }
+  const errors = [];
+  for (const [i, how] of plan.attempts.entries()) {
+    if (i > 0) ctx.say(`tentando por outro meio: ${how.label}`, 'warn');
+    if (how.note) ctx.say(how.note, 'info');
+    // a interface não tem como pedir a senha do sudo: a pessoa roda no terminal
+    if (how.needsSudo && !ctx.interactive) { errors.push({ full: `${how.note}. Rode no terminal: ${how.cmd}` }); continue; }
+    progress(12, 'Conferindo o que o instalador precisa', 16);
+    const pre = await ensurePrereqs(account.command, how, ctx);
+    if (!pre.ok) { errors.push({ full: pre.error }); continue; }
+    progress(16, `${verb === 'atualizar' ? 'Baixando a versão nova' : 'Baixando e instalando'} via ${how.label}`, 82);
+    const r = await runAttempt(how, ctx);
+    if (!r.ok) { errors.push({ full: `falha ao ${verb} ${account.command} via ${how.label} (${r.cmd}): ${r.tail}${r.hint}`, brief: `falhou via ${how.label}: ${r.hint.trim() || 'veja o erro acima'}` }); continue; }
+    progress(84, 'Conferindo se a CLI abre', 93);
+    const v = await verifyInstall(account.command, how);
+    if (!v.ok) { errors.push({ full: v.error }); continue; }
+    if (how.migrateFrom) { progress(93, 'Removendo a instalação antiga', 97); await finishMigration(account.command, how, ctx); }
+    return { ok: true, how, exe: v.exe };
+  }
+  // brief: para o terminal, onde a saída do comando já apareceu ao vivo
+  const others = errors.slice(1).map((e) => e.full.split('\n')[0]);
+  return {
+    ok: false, how: plan.attempts[0],
+    error: errors[0].full + (others.length ? `\nTambém tentei: ${others.join(' · ')}` : ''),
+    brief: errors.map((e) => e.brief || e.full).join(' · '),
+  };
+}
+
 async function installAccount(name, verb = 'instalar') {
   const account = readAccounts().find((a) => a.name === name);
   if (!account) throw new Error('conta não encontrada');
   if (verb === 'atualizar' && SELF_UPDATING[account.command]) throw new Error(SELF_UPDATING[account.command]);
-  const how = await resolveInstall(account);
-  if (!how.cmd) throw new Error(how.note || `não há comando de instalação para "${account.command}"`);
-  // a interface não tem como pedir a senha do sudo: a pessoa roda no terminal
-  if (how.needsSudo) throw new Error(`${how.note}. Rode no terminal: ${how.cmd}`);
-  const min = NODE_MIN[account.command];
-  if (min && (PKG_METHODS.includes(how.method) || how.method === 'config') && Number(process.versions.node.split('.')[0]) < min) {
-    throw new Error(`${account.command} precisa do Node.js ${min} ou mais novo (você está no v${process.versions.node}). ` +
-      `Com nvm: nvm install ${min} && nvm alias default ${min}, depois abra o hub de novo.`);
-  }
-  const r = await runShell(how.cmd, 10 * 60 * 1000);
-  if (r.ok) {
-    if (!(await which(account.command))) {
-      const dir = how.method === 'native' ? homeRel(path.join(HOME, '.local', 'bin')) : how.method === 'npm' ? homeRel(npmBinDir((await npmPrefix()) || '')) : '';
-      throw new Error(`${account.command} foi ${verb === 'atualizar' ? 'atualizado' : 'instalado'} via ${how.label}, mas não está no PATH${dir ? ` (procure em ${dir})` : ''}: abra um terminal novo ou adicione a pasta ao PATH e abra o hub de novo.`);
-    }
-    return how;
-  }
-  const output = (r.stdout + '\n' + r.stderr).trim().split('\n').slice(-8).join('\n');
-  const hint = /EACCES|EPERM|permission denied|Permission denied/.test(output) ? ` Sem permissão de escrita: rode no terminal com sudo (${how.cmd}) ${NPM_PREFIX_HINT}.` : '';
-  throw new Error(`falha ao ${verb} ${account.command} via ${how.label} (${how.cmd}): ${output}${hint}`);
+  const notes = [];
+  const r = await performInstall(account, { verb, say: (text, kind) => { if (kind !== 'cmd') notes.push(text); } });
+  if (!r.ok) throw new Error(r.error);
+  return { ...r.how, notes };
 }
 
 async function versions(installedMap) {
@@ -2210,13 +2609,17 @@ async function scanGarbage(accounts) {
 }
 
 async function cleanGarbage(body) {
+  progress(4, 'Medindo o que pode ser apagado', 20);
   const scan = await scanGarbage(readAccounts());
   const tool = scan.tools.find((t) => t.tool === String(body.tool || ''));
   if (!tool) throw new Error('nada para limpar');
   const want = new Set(asList(body.items).map(String));
   const results = [];
   let freed = 0;
-  for (const it of tool.items.filter((x) => want.has(x.id))) {
+  const picked = tool.items.filter((x) => want.has(x.id));
+  for (const [n, it] of picked.entries()) {
+    progress(20 + (75 * n) / picked.length, `Apagando ${it.what || it.display} (${n + 1} de ${picked.length})`, 20 + (75 * (n + 1)) / picked.length);
+    await new Promise((res) => setImmediate(res));
     if (it.kind === 'sudo') { results.push({ label: it.display, ok: false, msg: `precisa de sudo. Rode: ${it.command}` }); continue; }
     if (it.risky) { results.push({ label: it.display, ok: false, msg: `feche o ${tool.title} antes` }); continue; }
     try {
@@ -2232,6 +2635,7 @@ async function cleanGarbage(body) {
 }
 
 async function cleanupTool(body) {
+  progress(4, 'Levantando o que está instalado', 20);
   const accounts = readAccounts();
   const inv = (await toolInventory(accounts)).find((t) => t.command === String(body.tool || ''));
   if (!inv) throw new Error('ferramenta desconhecida');
@@ -2241,6 +2645,7 @@ async function cleanupTool(body) {
   // CLI e dados só sem conta no hub; pastas órfãs (sem conta) sempre podem sair.
   for (const i of inv.installs.filter((x) => want.has(x.id))) {
     if (inUse) { results.push({ label: i.label, ok: false, msg: 'em uso por uma conta do hub' }); continue; }
+    progress(25, `Removendo ${i.label}`, 70);
     if (i.kind === 'npm') {
       if (!i.writable) { results.push({ label: i.label, ok: false, msg: `precisa de sudo. Rode: ${i.command}` }); continue; }
       const r = await run(npmBinOf(i.prefix), ['uninstall', '-g', CLEAN_TOOLS[inv.command].pkg], 5 * 60 * 1000,
@@ -2878,6 +3283,7 @@ function unmaskEnv(list) {
 }
 
 async function state() {
+  progress(95, 'Atualizando a tela', 99);
   const accounts = readAccounts();
   const infos = await installInfos(accounts);
   const inst = { aws: await which('aws') };
@@ -2885,7 +3291,8 @@ async function state() {
   await Promise.all(accounts.map(async (a) => {
     const how = await resolveInstall(a, infos[a.command] || null);
     a.installCmd = how.cmd;
-    a.installMethod = inst[a.command] ? how.label : '';
+    // o meio em que a CLI está hoje (numa migração, how já aponta para o meio novo)
+    a.installMethod = inst[a.command] ? (infos[a.command] && infos[a.command].label) || how.label : '';
     a.installPath = how.path ? homeRel(how.path) : '';
     a.installNote = how.note;
     a.installNeedsSudo = how.needsSudo;
@@ -2946,6 +3353,24 @@ function tokenOk(req) {
   return got.length === want.length && crypto.timingSafeEqual(got, want);
 }
 
+// Primeira etapa das operações que não têm etapas próprias mais abaixo: [texto, até onde a barra vai nela].
+const OP_FIRST_STAGE = {
+  'POST /api/login/refresh': ['Conferindo o login de cada conta', 92],
+  'POST /api/sync/refresh': ['Conferindo contas, versões e logins', 92],
+  'PUT /api/accounts': ['Salvando a conta', 60],
+  'POST /api/aws/profiles': ['Gravando as chaves em ~/.aws', 60],
+  'POST /api/aws/profiles/remove': ['Removendo o perfil da AWS', 60],
+  'POST /api/aws/test': ['Testando as credenciais na AWS', 95],
+  'POST /api/bedrock/models': ['Consultando os modelos disponíveis na sua conta AWS', 95],
+  'POST /api/bedrock/models/apply': ['Consultando e gravando os modelos mais recentes do Bedrock', 90],
+  'POST /api/models/apply': ['Consultando os modelos mais recentes na fonte oficial', 90],
+  'POST /api/instructions/save': ['Gravando a instrução nas ferramentas escolhidas', 80],
+  'POST /api/instructions/remove': ['Removendo a instrução', 80],
+  'POST /api/skills/deps': ['Conferindo as dependências da skill', 95],
+  'POST /api/skills/copy': ['Copiando a skill', 80],
+  'POST /api/skills/remove': ['Removendo a skill', 80],
+};
+
 let connected = false;
 const server = http.createServer(async (req, res) => {
   const port = server.address().port;
@@ -2981,6 +3406,18 @@ const server = http.createServer(async (req, res) => {
   }
   if (!url.pathname.startsWith('/api/')) return send(res, 404, { error: 'não encontrado' });
   if (!tokenOk(req)) return send(res, 401, { error: 'token inválido. Abra a URL exibida no terminal' });
+  if (req.method === 'GET' && url.pathname === '/api/progress') {
+    const op = ops.get(String(url.searchParams.get('op') || ''));
+    return send(res, 200, op ? { pct: op.pct, to: op.to, label: op.label } : {});
+  }
+  const opId = String(req.headers['x-hub-op'] || '');
+  if (/^[a-z0-9]{8,40}$/.test(opId) && ops.size < 200) {
+    ops.set(opId, { pct: 0, to: 0, label: '' });
+    opStore.enterWith(opId);
+    res.on('close', () => ops.delete(opId));
+    const first = OP_FIRST_STAGE[`${req.method} ${url.pathname}`];
+    if (first) progress(4, first[0], first[1]);
+  }
 
   try {
     if (req.method === 'GET' && url.pathname === '/api/detect') {
@@ -3079,6 +3516,7 @@ const server = http.createServer(async (req, res) => {
       if (TTY) event('ok', `CLI de ${C.bold(String(body.name))} atualizada`);
       // atualizar o cliente não basta: os modelos fixados na configuração local também precisam acompanhar
       let lastModels;
+      progress(88, 'Atualizando os modelos fixados', 94);
       try { lastModels = await modelsApply(String(body.name || '')); } catch (e) { lastModels = { error: e.message, applied: [], rows: [] }; }
       if (TTY && lastModels.applied.length) event('ok', `modelos de ${C.bold(String(body.name))}: ${lastModels.applied.join(' · ')}`);
       if (TTY && lastModels.error) event('bad', `modelos de ${C.bold(String(body.name))}: ${lastModels.error}`);
@@ -3272,7 +3710,7 @@ if (require.main !== module) {
   module.exports = {
     HOME, CONFIG, IS_WIN, IS_MAC, IS_WSL, systemInfo, systemDetails, repoInfo, TYPES, DEFAULT_INSTALL, SELF_UPDATING, NODE_MIN, installCmd,
     INSTALL_WAYS, METHOD_LABEL, PKG_METHODS, wayCmd, classifyInstall, installInfo, installInfoFrom, installInfos, resolveInstall, npmNeedsSudo, npmPrefix, SYS_PMS, sysPkgOf,
-    run, runShell, shellArgs, which, whichAll, python, pyRun, expandHome, homeRel, spawnArgs, winQuote, fullEnv, renameSafe, rmSafe,
+    run, runShell, shellArgs, npmCleanLeftovers, npmPkgsOf, performInstall, installPlan, refreshPath, nodeSatisfies, npmEngines, which, whichAll, python, pyRun, expandHome, homeRel, spawnArgs, winQuote, fullEnv, renameSafe, rmSafe,
     readAccounts, writeAccounts, validateAccounts, parseConfig, inferType, effectiveType, bedrockSource, claudeSettingsEnv, awsEnvOf,
     awsProfiles, iniSections, AWS_CONFIG, AWS_CREDENTIALS,
     loginStatus, codexLogin, geminiLogin, copilotLogin, claudeRelogin, detectAccounts,

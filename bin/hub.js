@@ -321,8 +321,24 @@ async function pause() {
 }
 function clearScreen() { if (TTY_OUT) out('\x1b[H\x1b[2J'); }
 // Redesenha por cima, sem limpar a tela: limpar a cada tecla faz a tela piscar.
-const paintText = (s) => '\x1b[H' + s.replace(/\n/g, '\x1b[K\n') + '\x1b[K\x1b[J';
-const paint = (s) => out(paintText(s));
+// Nunca escreve mais linhas do que a altura do terminal: se passar, o terminal rola e
+// cada redesenho empurra o topo (o mascote) para o histórico, duplicando-o no scroll.
+const termRows = () => (TTY_OUT && process.stdout.rows) || 0;
+function fitRows(s) {
+  const rows = termRows();
+  const lines = s.split('\n');
+  if (!rows || lines.length <= rows) return s;
+  // mantém visível a linha em foco: o prompt de comando ou o item selecionado
+  let focus = lines.findIndex((l) => l.includes('▏'));
+  if (focus < 0) focus = lines.findIndex((l) => l.includes('❯'));
+  let start = 0;
+  if (focus >= rows - 1) start = Math.min(focus - rows + 2, lines.length - rows);
+  return lines.slice(start, start + rows).join('\n');
+}
+const paintText = (s) => '\x1b[H' + fitRows(s).replace(/\n/g, '\x1b[K\n') + '\x1b[K\x1b[J';
+let LAST_PAINT = null;
+const paint = (s) => { LAST_PAINT = s; out(paintText(s)); };
+if (TTY_OUT) process.stdout.on('resize', () => { if (LAST_PAINT !== null) out(paintText(LAST_PAINT)); });
 
 function spawnFail(file, e) {
   warnErr(`hub: não consegui executar "${file}": ${e.code === 'ENOENT' ? 'comando não encontrado' : e.message}`);
@@ -347,6 +363,33 @@ async function runChild(file, argv, env, extra = {}) {
 // No Windows, os .cmd do npm passam pelo cmd.exe.
 const runCli = (cmd, args, env) => { const [f, a, o] = lib.spawnArgs(cmd, args); return runChild(f, a, env, o); };
 const runShellLine = (line, env) => { const [f, a, o] = lib.shellArgs(line); return runChild(f, a, env, o); };
+// Roda uma linha de instalação mostrando a saída ao vivo e guardando o final dela: é o que o motor de
+// instalação (lib.performInstall) lê para reconhecer falhas com conserto. O teclado continua no filho (senha do sudo).
+async function teeExec(line) {
+  const [f, a, o] = lib.shellArgs(line);
+  inputOff();
+  CHILD = true;
+  try {
+    return await new Promise((resolve) => {
+      let so = '', se = '', done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      const env = Object.assign({}, process.env, COLOR ? { FORCE_COLOR: '1', npm_config_color: 'always' } : {});
+      let child;
+      try { child = spawn(f, a, Object.assign({ stdio: ['inherit', 'pipe', 'pipe'], env }, o)); }
+      catch (e) { finish({ ok: false, code: spawnFail(f, e), stdout: '', stderr: String(e.message) }); return; }
+      child.stdout.on('data', (d) => { process.stdout.write(d); so = (so + d).slice(-65536); });
+      child.stderr.on('data', (d) => { process.stderr.write(d); se = (se + d).slice(-65536); });
+      child.on('error', (e) => finish({ ok: false, code: spawnFail(f, e), stdout: so, stderr: se + String(e.message) }));
+      child.on('close', (code, sig) => {
+        const c = code != null ? code : 128 + ((sig && os.constants.signals[sig]) || 1);
+        finish({ ok: c === 0, code: c, stdout: so, stderr: se });
+      });
+    });
+  } finally { CHILD = false; }
+}
+// Recados do motor de instalação, no formato do terminal.
+const installSay = (text, kind) => echo(kind === 'cmd' ? `  ${TEAL}→${N} ${text}` : kind === 'warn' ? `  ${YEL}!${N} ${text}` : `  ${GRAY}${text}${N}`);
+const installVia = (a, verb, info) => lib.performInstall(a, { verb, info, interactive: TTY_IN, exec: teeExec, say: installSay });
 
 const FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
 async function spinRun(msg, promise) {
@@ -388,15 +431,6 @@ function nameWidth() {
   return w > 24 ? 24 : w;
 }
 
-function nodeOk(cmd, method) {
-  const min = lib.NODE_MIN[cmd];
-  // só importa quando a CLI roda no Node da máquina (npm & cia.); binário nativo, brew e winget trazem o próprio runtime
-  if (!min || NODE_MAJOR >= min || (method && method !== 'config' && !lib.PKG_METHODS.includes(method))) return true;
-  echo(`${RED}✗${N} ${cmd} precisa do Node.js ${min} ou mais novo (você está no v${process.versions.node}).`);
-  echo(`  ${GRAY}com nvm: nvm install ${min} && nvm alias default ${min} · depois abra um terminal novo${N}`);
-  return false;
-}
-
 async function installMissing(names = [], opts = {}) {
   for (const n of names) if (!byName.has(n)) { warnErr(`${RED}✗${N} conta desconhecida: ${n}`); return 1; }
   const miss = missing(names);
@@ -425,21 +459,11 @@ async function installMissing(names = [], opts = {}) {
     return 1;
   }
   for (const a of todo) {
-    const h = how.get(a);
-    const cmd = h.cmd;
-    if (/^(sudo )?npm /.test(cmd) && !findExe('npm')) { echo(`${RED}✗${N} ${a.command}: precisa do Node.js/npm (https://nodejs.org)`); continue; }
-    if (/^curl /.test(cmd) && !findExe('curl')) { echo(`${RED}✗${N} ${a.command}: precisa do curl`); continue; }
-    if (/^powershell /i.test(cmd) && !findExe('powershell')) { echo(`${RED}✗${N} ${a.command}: precisa do PowerShell`); continue; }
-    if (/^brew /.test(cmd) && !findExe('brew')) { echo(`${RED}✗${N} ${a.command}: precisa do Homebrew (https://brew.sh)`); continue; }
-    if (/^winget /.test(cmd) && !findExe('winget')) { echo(`${RED}✗${N} ${a.command}: precisa do winget`); continue; }
-    if (!nodeOk(a.command, h.method)) continue;
-    echo(`${TEAL}→${N} ${cmd}`);
-    if ((await runShellLine(cmd, process.env)) !== 0) { echo(`${RED}✗${N} falhou ao instalar ${a.command}${h.needsSudo ? `\n  ${GRAY}${h.note}${N}` : ''}`); continue; }
-    if (installed(a)) echo(`${GREEN}✓${N} ${a.command} instalado via ${h.label}: no primeiro uso, faça login dentro dele`);
-    else {
-      const dir = h.method === 'native' ? '~/.local/bin' : h.method === 'npm' ? 'a pasta bin do npm global' : 'a pasta de instalação';
-      echo(`${YEL}!${N} ${a.command} instalado via ${h.label}, mas ainda não aparece no PATH: abra um terminal novo (ou adicione ${dir} ao PATH) e rode ${B}hub${N} de novo`);
-    }
+    echo(`${TEAL}→${N} ${B}${a.command}${N}`);
+    // o motor escolhe o meio, conserta o que tem conserto (sobras do npm, cache, rede…) e tenta outro meio se este falhar
+    const r = await installVia(a, 'instalar', null);
+    if (!r.ok) { echo(`${RED}✗${N} não consegui instalar ${a.command}: ${r.brief}`); continue; }
+    echo(`${GREEN}✓${N} ${a.command} instalado via ${r.how.label}${r.exe ? ` ${GRAY}(${lib.homeRel(r.exe)})${N}` : ''}: no primeiro uso, faça login dentro dele`);
   }
   return 0;
 }
@@ -475,19 +499,17 @@ async function updateInstalled(names = []) {
     // atualiza pelo mesmo meio em que a CLI foi instalada (npm, Homebrew, instalador oficial…)
     const h = await howInstalled(a);
     const before = await versionOf(a.command);
-    echo(`${TEAL}→${N} ${a.command} ${GRAY}(${before || 'versão desconhecida'} · ${h.label}${h.path ? ` · ${lib.homeRel(h.path)}` : ''})${N}`);
+    echo(`${TEAL}→${N} ${a.command} ${GRAY}(${before || 'versão desconhecida'} · ${(lib.installInfoFrom(a.command, findExe(a.command)) || h).label}${h.path ? ` · ${lib.homeRel(h.path)}` : ''})${N}`);
     if (!h.cmd) { echo(`  ${YEL}!${N} ${h.note || `sem comando de atualização: defina ${B}install = …${N} no config`}`); continue; }
-    if (!nodeOk(a.command, h.method)) continue;
-    echo(`  ${GRAY}${h.cmd}${N}`);
-    if (h.needsSudo) echo(`  ${YEL}!${N} ${h.note}`);
     // saída ao vivo: dá para ver o erro real e digitar a senha do sudo se precisar
-    const code = await runShellLine(h.cmd, process.env);
-    if (code === 0) {
+    const r = await installVia(a, 'atualizar', lib.installInfoFrom(a.command, findExe(a.command)));
+    if (r.ok) {
       const after = await versionOf(a.command);
-      if (before && before === after) echo(`  ${GREEN}✓${N} já estava na mais recente (${after})`);
+      if (r.how.migrateFrom) echo(`  ${GREEN}✓${N} migrado para ${r.how.label}: ${before || '?'} → ${B}${after || '?'}${N}`);
+      else if (before && before === after) echo(`  ${GREEN}✓${N} já estava na mais recente (${after})`);
       else echo(`  ${GREEN}✓${N} atualizado: ${before || '?'} → ${B}${after || '?'}${N}`);
     } else {
-      echo(`  ${RED}✗${N} falhou (código ${code}): veja o erro acima${h.needsSudo ? '' : ` ou rode manualmente: ${h.cmd}`}`);
+      echo(`  ${RED}✗${N} ${r.brief}`);
     }
   }
   return 0;
@@ -989,12 +1011,17 @@ async function check() {
     const profile = envVal(a, 'AWS_PROFILE') || (isBedrock(a) ? lib.awsEnvOf({ command: a.command, env: Object.fromEntries(a.envList) }).AWS_PROFILE || 'default' : '');
     let aws = null;
     if (profile && hasAws) aws = (await lib.run('aws', ['sts', 'get-caller-identity'], 20000, { ...Object.fromEntries(a.envList), AWS_PROFILE: profile })).ok;
-    return { a, inst, version, profile, aws, how };
+    // duas instalações da mesma CLI: a que vem primeiro no PATH é a que roda, e a outra costuma ficar velha
+    const real = (f) => { try { return fs.realpathSync(f); } catch { return f; } };
+    const all = inst ? await lib.whichAll(a.command) : [];
+    const dups = all.filter((f, i) => i > 0 && real(f) !== real(all[0]) && all.findIndex((g) => real(g) === real(f)) === i);
+    return { a, inst, version, profile, aws, how, dups };
   }));
-  for (const { a, inst, version, profile, aws, how } of rows) {
+  for (const { a, inst, version, profile, aws, how, dups } of rows) {
     if (inst) {
       out(`  ${GREEN}✓${N} ${padEnd(a.name, nw)} ${padEnd(a.command, 8)} ${GRAY}${version} · ${how.label}${how.path ? ` · ${lib.homeRel(how.path)}` : ''}${N}\n`);
       if (how.note) out(`    ${' '.repeat(nw)} ${YEL}${how.note}${N}\n`);
+      if (dups.length) out(`    ${' '.repeat(nw)} ${YEL}há outra instalação que não é usada: ${dups.map(lib.homeRel).join(', ')}${N}\n`);
     } else out(`  ${RED}✗${N} ${padEnd(a.name, nw)} ${padEnd(a.command, 8)} ${GRAY}não instalado (${how.cmd ? `via ${how.label}: ${how.cmd}` : how.note || 'sem instalador conhecido'})${N}\n`);
     if (!profile) continue;
     if (!hasAws) out(`    ${' '.repeat(nw)} ${RED}aws CLI não instalado${N}\n`);
@@ -1239,12 +1266,14 @@ function renderRaw(interactive, cmdMode, cmdBuf) {
       o += `  ${ptr} ${TEAL}${pad(ACTION_CMD[act], 10)}${N} ${selOn}${ACTION_LABEL[act]}${N}\n`;
     }
   });
-  o += '\n';
-  o += `  ${GRAY}# /ui       abre a interface no navegador para cadastrar contas e credenciais${N}\n`;
-  o += `  ${GRAY}# /verify   verifica quais CLIs estão instaladas e se as credenciais AWS funcionam${N}\n`;
-  o += `  ${GRAY}# /install  instala as CLIs cadastradas que ainda faltam${N}\n`;
-  o += `  ${GRAY}# /update   atualiza as CLIs para a versão mais recente (novos modelos e recursos)${N}\n`;
-  o += `  ${GRAY}# /skills   lista as skills de cada conta e instala novas a partir do GitHub${N}\n`;
+  let hints = `  ${GRAY}# /ui       abre a interface no navegador para cadastrar contas e credenciais${N}\n`;
+  hints += `  ${GRAY}# /verify   verifica quais CLIs estão instaladas e se as credenciais AWS funcionam${N}\n`;
+  hints += `  ${GRAY}# /install  instala as CLIs cadastradas que ainda faltam${N}\n`;
+  hints += `  ${GRAY}# /update   atualiza as CLIs para a versão mais recente (novos modelos e recursos)${N}\n`;
+  hints += `  ${GRAY}# /skills   lista as skills de cada conta e instala novas a partir do GitHub${N}\n`;
+  // as dicas são o primeiro corte quando o terminal é baixo (ex.: painel da IDE)
+  const rows = interactive ? termRows() : 0;
+  if (!rows || o.split('\n').length + 10 <= rows) o += '\n' + hints;
   o += '\n';
   if (interactive && cmdMode) {
     const sug = suggestCmd(cmdBuf);

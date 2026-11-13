@@ -763,6 +763,12 @@
   .check input { width: 18px; height: 18px; margin: 2px 0 0; accent-color: var(--accent); flex: none; }
   .check:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
   .check .sub { color: var(--muted); font-size: 12.5px; }
+  #wrap-launch .check { padding: 10px 12px; }
+  #wrap-launch .check .flag { font-size: 11.5px; color: var(--muted); overflow-wrap: anywhere; }
+  #wrap-launch .check.risk:has(input:checked) { border-color: var(--amber); background: var(--amber-soft); }
+  #wrap-launch .check.risk input { accent-color: var(--amber); }
+  .sub-label { font-size: 12.5px; font-weight: 600; color: var(--muted); margin-top: 4px; }
+  .chip.warn { background: var(--amber-soft); color: var(--amber); border-color: transparent; }
   .howto { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
   .howto h5, .next h5 { margin: 0 0 8px; font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
   .howto ol, .next ol { margin: 0; padding-left: 20px; display: grid; gap: 6px; font-size: 13.5px; color: var(--text-2); }
@@ -776,6 +782,26 @@
   .callout { font-size: 13px; padding: 11px 13px; border-radius: 11px; background: var(--accent-soft); color: var(--text-2); display: flex; gap: 10px; align-items: flex-start; }
   .callout svg { color: var(--accent); margin-top: 1px; }
   .callout code { background: var(--surface); padding: 1px 5px; border-radius: 5px; }
+
+  /* Progresso das operações demoradas: um cartão por operação, no canto oposto ao dos avisos */
+  .progs { position: fixed; bottom: 20px; left: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 60; width: min(380px, calc(100vw - 40px)); pointer-events: none; }
+  .prog { background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow-lg); padding: 13px 15px 12px; animation: toast .25s ease-out; pointer-events: auto; transition: opacity .3s; }
+  .prog.leaving { opacity: 0; }
+  .prog-head { display: flex; align-items: center; gap: 9px; font-size: 14px; }
+  .prog-head strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+  .prog-head .i { width: 17px; height: 17px; color: var(--green); flex: none; }
+  .prog-pct { font-variant-numeric: tabular-nums; font-weight: 650; font-size: 13px; color: var(--text-2); }
+  .prog-bar { height: 6px; border-radius: 999px; background: var(--surface-3); overflow: hidden; margin: 10px 0 8px; }
+  .prog-bar > span { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--accent); transition: width .35s linear; position: relative; overflow: hidden; }
+  .prog-bar > span::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .45), transparent); transform: translateX(-100%); animation: prog-shine 1.4s ease-in-out infinite; }
+  .prog.done .prog-bar > span { background: var(--green); }
+  .prog.done .prog-bar > span::after { display: none; }
+  @keyframes prog-shine { to { transform: translateX(100%); } }
+  .prog-foot { display: flex; gap: 10px; font-size: 12.5px; color: var(--muted); }
+  .prog-step { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .prog-time { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  @media (max-width: 560px) { .progs { left: 16px; right: 16px; bottom: 16px; width: auto; } }
+  @media (prefers-reduced-motion: reduce) { .prog, .prog-bar > span::after { animation: none; } .prog-bar > span { transition: none; } }
 
   .toasts { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 50; max-width: calc(100vw - 40px); }
   .toast {
@@ -1036,6 +1062,14 @@
           <p class="hint">Você vai abrir com <code>hub <span class="id-preview">…</span></code> no terminal.</p>
         </div>
         <div id="type-fields" class="stack"></div>
+        <div class="field" id="wrap-launch">
+          <span class="label" id="launch-label">Ao abrir <span class="optional">(opcional)</span></span>
+          <div class="check-list" id="launch-opts" role="group" aria-labelledby="launch-label"></div>
+          <p class="conn-note" id="launch-risk" hidden><svg class="i"><use href="#i-alert"/></svg><span>Com as permissões liberadas, a ferramenta edita arquivos e roda comandos sem pedir confirmação. Use só em projetos e pastas em que você confia.</span></p>
+          <label for="f-args" class="sub-label" id="launch-args-label">Argumentos</label>
+          <input class="input mono" type="text" id="f-args" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="--verbose" aria-describedby="launch-preview">
+          <p class="hint" id="launch-preview"></p>
+        </div>
         <details class="adv" id="advanced">
           <summary><svg class="i"><use href="#i-chev"/></svg>Mais opções</summary>
           <div class="inner">
@@ -1050,10 +1084,6 @@
             <div class="field" id="wrap-command">
               <label for="f-command">Executável</label>
               <input class="input mono" type="text" id="f-command" spellcheck="false">
-            </div>
-            <div class="field">
-              <label for="f-args">Argumentos fixos <span class="optional">(opcional)</span></label>
-              <input class="input mono" type="text" id="f-args" spellcheck="false" placeholder="--verbose">
             </div>
             <div class="field">
               <label for="f-install">Comando de instalação <span class="optional">(opcional)</span></label>
@@ -1328,6 +1358,7 @@
 </datalist>
 
 <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+<div class="progs" id="progs"></div>
 
 <script>
 'use strict';
@@ -1349,6 +1380,62 @@ const TYPES = {
   bedrock: { title: 'AWS Bedrock', id: 'claude-aws', label: 'Claude via AWS', short: 'Bedrock', hint: 'Chave de acesso AWS', logo: 'logo-bedrock', color: 'var(--c-bedrock)', command: 'claude', desc: 'Modelos cobrados na sua conta AWS. Por enquanto: Claude.' },
   custom:  { title: 'Outra CLI',   hint: 'Qualquer comando',    logo: 'i-terminal',   color: 'var(--c-custom)',  command: '',       desc: 'Qualquer ferramenta de terminal.' },
 };
+// Opções de abertura por executável: marcar uma delas escreve o argumento no campo "Argumentos" da conta.
+// risk = dispensa as confirmações da ferramenta (fica em destaque no formulário e no card).
+const LAUNCH_OPTS = {
+  claude: [
+    { flag: '--dangerously-skip-permissions', title: 'Liberar todas as permissões', desc: 'Não pede confirmação para editar arquivos nem rodar comandos.', risk: true },
+    { flag: '--permission-mode acceptEdits', title: 'Aceitar edições de arquivo', desc: 'Edita sem perguntar; comandos continuam pedindo confirmação.' },
+    { flag: '--continue', title: 'Continuar a última conversa', desc: 'Retoma a conversa mais recente da pasta em que você abrir.' },
+  ],
+  codex: [
+    { flag: '--dangerously-bypass-approvals-and-sandbox', title: 'Liberar todas as permissões', desc: 'Sem aprovações e sem sandbox.', risk: true },
+    { flag: '--search', title: 'Busca na web', desc: 'Deixa o Codex pesquisar na internet.' },
+  ],
+  gemini: [{ flag: '--yolo', title: 'Liberar todas as permissões', desc: 'Aprova todas as ações sem perguntar.', risk: true }],
+  copilot: [
+    { flag: '--allow-all-tools', title: 'Liberar todas as ferramentas', desc: 'Usa qualquer ferramenta sem pedir confirmação.', risk: true },
+    { flag: '--continue', title: 'Continuar a última conversa', desc: 'Retoma a sessão mais recente.' },
+  ],
+};
+const argTokens = (s) => String(s || '').trim().split(/\s+/).filter(Boolean);
+// Posição de uma opção (um ou mais tokens seguidos) dentro dos argumentos; -1 se não está.
+function argIndex(tokens, flag) {
+  const f = argTokens(flag);
+  for (let i = 0; i + f.length <= tokens.length; i++) if (f.every((t, k) => tokens[i + k] === t)) return i;
+  return -1;
+}
+const hasArg = (args, flag) => argIndex(argTokens(args), flag) >= 0;
+function setArg(args, flag, on) {
+  const tokens = argTokens(args);
+  const i = argIndex(tokens, flag);
+  if (on && i < 0) tokens.push(...argTokens(flag));
+  if (!on && i >= 0) tokens.splice(i, argTokens(flag).length);
+  return tokens.join(' ');
+}
+const launchOptsOf = (command) => LAUNCH_OPTS[command] || [];
+const riskyArgs = (a) => launchOptsOf(a.command).some((o) => o.risk && hasArg(a.args, o.flag));
+// Os quadros de marcar e o campo de texto mostram a mesma coisa: quem muda um atualiza o outro.
+function renderLaunch() {
+  const command = $('#f-command').value.trim();
+  const opts = launchOptsOf(command);
+  $('#launch-opts').hidden = !opts.length;
+  $('#launch-args-label').textContent = opts.length ? 'Outros argumentos (as opções acima aparecem aqui)' : 'Argumentos';
+  $('#launch-opts').innerHTML = opts.map((o, i) => `<label class="check${o.risk ? ' risk' : ''}">
+    <input type="checkbox" name="launch-opt" value="${i}">
+    <span><strong>${esc(o.title)}</strong><br><span class="sub">${esc(o.desc)}</span><br><code class="flag mono">${esc(o.flag)}</code></span></label>`).join('');
+  syncLaunch();
+}
+function syncLaunch() {
+  const command = $('#f-command').value.trim();
+  const opts = launchOptsOf(command);
+  const args = $('#f-args').value;
+  $$('input[name=launch-opt]').forEach((el) => { el.checked = hasArg(args, opts[Number(el.value)].flag); });
+  $('#launch-risk').hidden = !opts.some((o) => o.risk && hasArg(args, o.flag));
+  const full = [command, ...argTokens(args)].join(' ');
+  $('#launch-preview').innerHTML = command ? `O hub abre com <code>${esc(full)}</code>` : '';
+}
+
 const BEDROCK_PROVIDERS = {
   claude: { title: 'Claude', by: 'Anthropic', logo: 'logo-claude', command: 'claude' },
 };
@@ -1396,20 +1483,123 @@ function mascot(mood = 'happy', size = 64) {
   </svg>`;
 }
 
+// ---------- Progresso das operações demoradas ----------
+// Título do cartão para cada chamada que pode demorar. O que não está aqui não mostra cartão.
+const skillsWord = (b) => { const l = b.skills || []; return l.length === 1 ? `a skill ${l[0]}` : `${l.length} skills`; };
+const OP_TITLE = {
+  'POST /api/install': (b) => `Instalando a CLI de ${b.name}`,
+  'POST /api/update': (b) => `Atualizando a CLI de ${b.name}`,
+  'POST /api/models/apply': (b) => `Atualizando os modelos de ${b.name}`,
+  'POST /api/bedrock/models': () => 'Consultando os modelos do Bedrock',
+  'POST /api/bedrock/models/apply': () => 'Atualizando os modelos do Bedrock',
+  'POST /api/skills/preview': () => 'Buscando skills no repositório',
+  'POST /api/skills/install': (b) => `Instalando ${skillsWord(b)}`,
+  'POST /api/skills/update': (b) => `Atualizando a skill ${b.skill}`,
+  'POST /api/skills/copy': (b) => `Copiando a skill ${b.skill}`,
+  'POST /api/skills/remove': (b) => `Removendo a skill ${b.skill}`,
+  'POST /api/skills/deps': () => 'Conferindo as dependências',
+  'POST /api/skills/deps/install': () => 'Instalando as dependências',
+  'POST /api/instructions/save': () => 'Salvando a instrução',
+  'POST /api/instructions/remove': () => 'Removendo a instrução',
+  'POST /api/garbage/clean': () => 'Limpando arquivos desnecessários',
+  'POST /api/tools/clean': () => 'Removendo o que foi selecionado',
+  'PUT /api/accounts': () => 'Salvando as contas',
+  'POST /api/aws/profiles': () => 'Salvando as chaves da AWS',
+  'POST /api/aws/profiles/remove': () => 'Removendo o perfil da AWS',
+  'POST /api/aws/test': () => 'Testando as credenciais da AWS',
+  'POST /api/sync/refresh': () => 'Atualizando as informações',
+  'POST /api/login/refresh': () => 'Conferindo os logins',
+};
+const PROG_DELAY = 400;  // operação mais rápida que isso não mostra cartão (evita piscar)
+const PROG_TICK = 250;
+const elapsedText = (ms) => { const sec = Math.floor(ms / 1000); return sec < 60 ? `${sec} s` : `${Math.floor(sec / 60)} min ${String(sec % 60).padStart(2, '0')} s`; };
+// Acompanha uma operação: a porcentagem e a etapa vêm do servidor (/api/progress). Dentro de uma etapa longa,
+// a barra avança devagar até o limite que o servidor informou para ela, e nunca passa dali nem volta.
+function trackOp(title) {
+  const id = `${Math.random().toString(36).slice(2, 10).padEnd(8, '0')}${Date.now().toString(36)}`;
+  const started = Date.now();
+  let el = null, timer = null, shown = 0, target = 30, label = '', finished = false;
+  const paint = () => {
+    if (!el) return;
+    const pct = Math.floor(shown);
+    el.querySelector('.prog-pct').textContent = `${pct}%`;
+    el.querySelector('.prog-bar > span').style.width = `${shown}%`;
+    el.querySelector('.prog-bar').setAttribute('aria-valuenow', String(pct));
+    const step = el.querySelector('.prog-step');
+    if (step.textContent !== label) step.textContent = label;
+    const ms = Date.now() - started;
+    el.querySelector('.prog-time').textContent = ms >= 4000 ? elapsedText(ms) : '';
+  };
+  const show = () => {
+    el = document.createElement('div');
+    el.className = 'prog';
+    el.innerHTML = `<div class="prog-head"><span class="spin"></span><strong>${esc(title)}</strong><span class="prog-pct">0%</span></div>
+      <div class="prog-bar" role="progressbar" aria-label="${esc(title)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+      <div class="prog-foot"><span class="prog-step" role="status" aria-live="polite"></span><span class="prog-time"></span></div>`;
+    // um diálogo modal aberto deixa o resto da página inerte: o cartão vai para dentro dele
+    const open = $$('dialog[open]');
+    const box = $('#progs');
+    (open.length ? open[open.length - 1] : document.body).append(box);
+    box.append(el);
+    label = label || 'Começando…';
+    paint();
+  };
+  const tick = async () => {
+    if (finished) return;
+    if (!el && Date.now() - started >= PROG_DELAY) show();
+    try {
+      const r = await fetch(`/api/progress?op=${id}`, { headers: { 'X-Hub-Token': TOKEN } });
+      const p = r.ok ? await r.json() : {};
+      if (finished) return;
+      if (typeof p.pct === 'number') {
+        shown = Math.max(shown, p.pct);
+        target = Math.max(shown, p.to || p.pct);
+        if (p.label) label = p.label;
+      }
+    } catch {}
+    shown += (target - shown) * 0.035;
+    paint();
+  };
+  timer = setInterval(tick, PROG_TICK);
+  return {
+    id,
+    done(ok) {
+      finished = true;
+      clearInterval(timer);
+      if (!el) return;
+      const card = el;
+      const leave = (after) => setTimeout(() => { card.classList.add('leaving'); setTimeout(() => card.remove(), 300); }, after);
+      if (!ok) return leave(0);  // o erro aparece no próprio lugar da ação
+      shown = 100; label = 'Concluído';
+      paint();
+      card.classList.add('done');
+      card.querySelector('.spin').outerHTML = icon('check');
+      leave(900);
+    },
+  };
+}
+
 async function api(method, url, body) {
   await READY;
-  let res;
+  const title = OP_TITLE[`${method} ${url.split('?')[0]}`];
+  const op = title ? trackOp(title(body || {})) : null;
+  let res, ok = false;
   try {
-    res = await fetch(url, {
-      method, headers: { 'Content-Type': 'application/json', 'X-Hub-Token': TOKEN },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-  } catch {
-    throw new Error('O servidor do hub não está respondendo. Abra de novo com /ui no terminal');
+    try {
+      res = await fetch(url, {
+        method, headers: { 'Content-Type': 'application/json', 'X-Hub-Token': TOKEN, ...(op ? { 'X-Hub-Op': op.id } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch {
+      throw new Error('O servidor do hub não está respondendo. Abra de novo com /ui no terminal');
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `erro ${res.status}`);
+    ok = true;
+    return data;
+  } finally {
+    if (op) op.done(ok);
   }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `erro ${res.status}`);
-  return data;
 }
 
 const copyTimers = new WeakMap();
@@ -1598,6 +1788,9 @@ function accountCard(a, i) {
   const dir = a.env.CLAUDE_CONFIG_DIR || a.env.CODEX_HOME || a.env.COPILOT_HOME || a.env.GEMINI_CLI_HOME;
   if (dir && a.type !== 'bedrock') chips.push(`<span class="chip mono" title="Pasta de login">${esc(dir)}</span>`);
   if (a.type === 'bedrock' && a.bedrockFrom && a.bedrockFrom !== 'config') chips.push(`<span class="chip" title="${esc(a.bedrockFrom === 'settings' ? `CLAUDE_CODE_USE_BEDROCK=1 está no settings.json de ${dir || '~/.claude'}` : 'CLAUDE_CODE_USE_BEDROCK=1 está no ambiente do seu shell')}">Bedrock via ${a.bedrockFrom === 'settings' ? 'settings.json' : 'shell'}</span>`);
+  if (a.args) chips.push(riskyArgs(a)
+    ? `<span class="chip warn" title="Abre com: ${esc(`${a.command} ${a.args}`)}">permissões liberadas</span>`
+    : `<span class="chip mono" title="Argumentos ao abrir">${esc(a.args)}</span>`);
   // por onde a CLI foi instalada: é por esse meio que o hub atualiza
   if (ok && a.installMethod) chips.push(`<span class="chip" title="${esc(a.installPath ? `Instalada em ${a.installPath}` : 'Meio de instalação')}${a.installCmd ? `&#10;Atualiza com: ${esc(a.installCmd)}` : ''}">via ${esc(a.installMethod)}</span>`);
   const installNote = !job && a.installNote && (!ok || !SELF_UPDATING.includes(a.command))
@@ -2361,7 +2554,7 @@ function renderTypeFields(type, env = {}) {
     box.innerHTML = `<div class="field"><label for="f-exec">Qual comando abre a ferramenta?</label>
         <input class="input mono" type="text" id="f-exec" value="${esc($('#f-command').value)}" placeholder="ex.: aider" spellcheck="false" autocomplete="off">
         <p class="hint">O mesmo que você digitaria no terminal para abrir a ferramenta.</p></div>`;
-    $('#f-exec').addEventListener('input', (e) => { $('#f-command').value = e.target.value.trim(); });
+    $('#f-exec').addEventListener('input', (e) => { $('#f-command').value = e.target.value.trim(); renderLaunch(); });
   }
   $('#wrap-command').hidden = type === 'custom';
 }
@@ -2449,6 +2642,7 @@ function applyType(type, env = {}) {
   }
   renderStepTool(type);
   renderTypeFields(type, env);
+  renderLaunch();
   updateIdPreviews();
 }
 
@@ -2465,7 +2659,7 @@ function openAccount(index = null, presetType = null) {
   $('#f-install').value = a ? a.install || '' : '';
   const managed = a ? MANAGED[a.type] || [] : [];
   $('#f-env').value = a ? Object.entries(a.env).filter(([k]) => !managed.includes(k)).map(([k, v]) => `${k}=${v}`).join('\n') : '';
-  $('#advanced').open = Boolean(a && (a.args || a.install || $('#f-env').value));
+  $('#advanced').open = Boolean(a && (a.install || $('#f-env').value));
   $$('input[name=type]').forEach((r) => { r.checked = false; });
   const type = a ? a.type : presetType;
   if (type) applyType(type, a ? a.env : {});
@@ -2537,7 +2731,7 @@ function collectAccount() {
   }
   const command = $('#f-command').value.trim() || TYPES[type].command;
   if (!command) errors.push(fieldError($('#f-exec') || $('#f-command'), 'Informe o comando que abre a ferramenta.'));
-  else if (!/^[A-Za-z0-9._~/\\:-]+$/.test(command)) errors.push(fieldError($('#f-exec') || $('#f-command'), 'Só o nome do programa (ex.: aider). Argumentos vão em "Mais opções → Argumentos".'));
+  else if (!/^[A-Za-z0-9._~/\\:-]+$/.test(command)) errors.push(fieldError($('#f-exec') || $('#f-command'), 'Só o nome do programa (ex.: aider). Argumentos vão em "Ao abrir → Argumentos".'));
 
   if (errors.some((el) => el.closest('#advanced'))) $('#advanced').open = true;
   if (errors.length) {
@@ -2560,6 +2754,7 @@ function renderReview({ account: a, newProfile }) {
     if (a.env.ANTHROPIC_MODEL) rows.push(['ID do modelo', `<code>${esc(a.env.ANTHROPIC_MODEL)}</code>`]);
   }
   if (a.type === 'custom') rows.push(['Executável', `<code>${esc(a.command)}</code>`]);
+  if (a.args) rows.push(['Ao abrir', `<code>${esc(`${a.command} ${a.args}`)}</code>${riskyArgs(a) ? ' <span class="tag warn">permissões liberadas</span>' : ''}`]);
   const installed = Boolean(state.installed[a.command]);
   const next = [];
   if (!installed) next.push(`A ferramenta <code>${esc(a.command)}</code> ainda não está instalada. Depois de salvar, use o botão <b>Instalar</b> no card (ou <code>/install</code> no terminal).`);
@@ -2592,7 +2787,6 @@ async function runJob(account, job, { quiet = false } = {}) {
   const say = (msg, kind) => { if (!quiet) toast(msg, kind); };
   busy.set(account.command, job);
   render();
-  say(`${job === 'update' ? 'Atualizando' : 'Instalando'} ${account.command}… pode levar um minuto.`, 'info');
   try {
     state = await api('POST', job === 'update' ? '/api/update' : '/api/install', { name: account.name });
     const after = out.after = state.versions?.[account.command];
@@ -3282,6 +3476,13 @@ function confirmDialog(title, html) {
 document.addEventListener('click', async (e) => {
   const closer = e.target.closest('[data-close]');
   if (closer) return closer.closest('dialog').close();
+  // Botões "Fechar"/"Concluir" (value="close") submeteriam o form, e os handlers de
+  // submit fazem preventDefault — o diálogo não fecharia (ou pior, repetiria a ação).
+  const closeBtn = e.target.closest('button[value="close"]');
+  if (closeBtn && closeBtn.closest('dialog')) {
+    e.preventDefault();
+    return closeBtn.closest('dialog').close('close');
+  }
 
   const reveal = e.target.closest('[data-reveal]');
   if (reveal) {
@@ -3533,6 +3734,14 @@ $('#form-account').addEventListener('click', (e) => {
   if (go) goStep(Number(go.dataset.stepGo));
 });
 $('#f-label').addEventListener('input', () => { if (!nameTouched) syncName(); });
+$('#f-args').addEventListener('input', syncLaunch);
+$('#f-command').addEventListener('input', renderLaunch);
+$('#launch-opts').addEventListener('change', (e) => {
+  const opt = launchOptsOf($('#f-command').value.trim())[Number(e.target.value)];
+  if (!opt) return;
+  $('#f-args').value = setArg($('#f-args').value, opt.flag, e.target.checked);
+  syncLaunch();
+});
 $('#f-name').addEventListener('input', (e) => {
   nameTouched = true;
   const pos = e.target.selectionStart;

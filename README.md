@@ -27,7 +27,7 @@ Escolha no menu, use, saia e volte para o menu.
 
 ## Instalação
 
-Você precisa de [Node.js](https://nodejs.org) 18 ou mais novo e `git`. O [AWS CLI](https://aws.amazon.com/cli/) só é necessário para contas Bedrock.
+Você precisa de [Node.js](https://nodejs.org) 18 ou mais novo e `git`; se faltarem, o instalador oferece instalá-los. O [AWS CLI](https://aws.amazon.com/cli/) só é necessário para contas Bedrock.
 Funciona no Linux, no macOS (inclusive com o bash antigo que vem no sistema), no WSL e no Windows nativo.
 
 **Linux, macOS e WSL**
@@ -88,6 +88,8 @@ Enquanto a interface está aberta, o terminal mostra o endereço; aperte `q` par
 No menu, use **↑ ↓ + Enter** ou digite o número da conta. Ao sair da CLI, você volta para o menu.
 
 Também dá para ir direto: `hub claude-aws`. Argumentos extras vão para a CLI: `hub claude --continue`.
+
+Para abrir sempre com os mesmos argumentos, edite a conta na interface e use o bloco **Ao abrir**: marque uma opção (ex.: **Liberar todas as permissões**, que no Claude vira `--dangerously-skip-permissions`) ou digite os argumentos. O card da conta mostra o aviso "permissões liberadas" quando uma dessas opções está ligada.
 
 ## Comandos do menu
 
@@ -212,7 +214,24 @@ O hub olha onde cada CLI está instalada e atualiza pelo mesmo meio, em vez de a
 | winget | pasta do WinGet | `winget upgrade --id …` (Claude, Codex e Copilot) |
 | Binário avulso | qualquer outro lugar | mostra onde está e onde baixar a versão nova |
 
-Se o npm global for do root (prefixo `/usr` ou `/usr/local`), o terminal usa `sudo` e pede a senha; a interface mostra o comando para rodar à mão ou a dica de mudar o prefixo do npm. Para quem ainda não tem a CLI, o hub instala pelo npm quando ele é do usuário; senão, pelo instalador oficial ou Homebrew. O campo `install` do config sempre tem prioridade sobre a detecção.
+Para quem ainda não tem a CLI, o hub tenta os meios disponíveis na máquina, em ordem, e passa para o próximo se um falhar: instalador oficial primeiro no Claude (não depende do Node), npm primeiro nas demais, depois Homebrew e winget. O campo `install` do config sempre tem prioridade sobre a detecção.
+
+O que o `/install` e o `/update` resolvem sozinhos:
+
+| Problema | O que o hub faz |
+|---|---|
+| Node antigo para o pacote (ex.: `claude-code` exige Node 22) | consulta a exigência no registro do npm e usa um meio que não depende do Node; numa CLI já instalada pelo npm, migra para o instalador oficial e remove a antiga |
+| Sobra de instalação interrompida (`ENOTEMPTY`), arquivo no lugar do executável (`EEXIST`), cache corrompido (`EINTEGRITY`) | limpa e tenta de novo |
+| Queda de rede no meio do download, Homebrew ocupado | espera e tenta de novo |
+| npm global do root numa instalação nova | instala em `~/.local`, sem `sudo` |
+| CLI instalada em outro prefixo do npm | atualiza no mesmo prefixo |
+| Falta `curl`, `bash` ou, no Alpine, as bibliotecas do Claude | instala pelo gerenciador de pacotes do sistema (pede a senha do `sudo` no terminal) |
+| CLI instalada fora do PATH do terminal aberto | passa a enxergar `~/.local/bin`, a pasta do npm, do Homebrew e do winget na hora |
+| winget sem atualização disponível ou perguntando sobre os termos | trata como sucesso e aceita os termos |
+
+Depois de instalar, o hub confere se o executável abre; se não abrir, diz o motivo (glibc antiga, biblioteca faltando, arquitetura errada, Node antigo). O que ele não resolve sozinho vem com o comando para rodar: atualizar uma CLI de um npm global do root (o terminal usa `sudo`; a interface mostra o comando), disco cheio, certificado de proxy corporativo e Node antigo quando a CLI só existe no npm.
+
+Os instaladores do hub (`install.sh` e `install.ps1`) também oferecem instalar o Node.js LTS (Homebrew, nvm ou winget) e o git quando faltam.
 
 <details>
 <summary><b>Mais detalhes</b></summary>

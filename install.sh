@@ -27,7 +27,9 @@ link_target() {
   printf '%s/%s' "$(cd -P "$(dirname "$p")" && pwd)" "$(basename "$p")"
 }
 
-short() { printf '%s' "${1/#$HOME/\~}"; }
+# em variável: no bash 5.2+ um \~ escrito direto na substituição sai com a barra na tela
+TILDE='~'
+short() { printf '%s' "${1/#$HOME/$TILDE}"; }
 
 nap() { ((ANIMATE)) && sleep "$1"; return 0; }
 
@@ -84,7 +86,7 @@ remove_path_line() {
     tmp=$(mktemp "$rc.XXXXXX")
     awk 'prev == "# agent-hub" && /^export PATH="\$HOME\/\.local\/bin:\$PATH"$/ { prev = ""; next } { if (prev != "") print prev; prev = $0 } END { if (prev != "" && prev != "# agent-hub") print prev }' "$rc" >"$tmp"
     cat "$tmp" >"$rc" && rm -f "$tmp"
-    ok "linha do PATH removida" "${rc/#$HOME/\~}"
+    ok "linha do PATH removida" "${rc/#$HOME/$TILDE}"
   done
 }
 
@@ -150,19 +152,76 @@ case $SYS_KIND in
   other) warn "$SYS_NAME" "sistema não testado: o hub foi feito para Linux, macOS e Windows" ;;
   *) ok "$SYS_NAME" "o hub vai instalar e gravar tudo no padrão deste sistema" ;;
 esac
+# Instala um pacote do sistema pelo gerenciador que a máquina tiver (pede a senha do sudo se precisar).
+sys_install() {
+  local pkg=$1 sudo=""
+  [[ $(id -u) -eq 0 ]] || sudo="sudo"
+  if command -v brew >/dev/null; then brew install "$pkg"
+  elif command -v apt-get >/dev/null; then $sudo apt-get install -y "$pkg"
+  elif command -v dnf >/dev/null; then $sudo dnf install -y "$pkg"
+  elif command -v yum >/dev/null; then $sudo yum install -y "$pkg"
+  elif command -v pacman >/dev/null; then $sudo pacman -S --needed --noconfirm "$pkg"
+  elif command -v zypper >/dev/null; then $sudo zypper --non-interactive install "$pkg"
+  elif command -v apk >/dev/null; then $sudo apk add "$pkg"
+  else return 1; fi
+}
+# Pergunta antes de instalar algo na máquina. Sem terminal (script, CI) só instala com HUB_YES=1.
+confirm() {
+  local reply
+  [[ -n ${HUB_YES:-} ]] && return 0
+  [[ -t 0 ]] || return 1
+  read -rp "    $1 [S/n] " reply || return 1
+  [[ -z $reply || $reply == [sSyY]* ]]
+}
+# Node ausente ou antigo: instala o LTS. Com Homebrew, por ele; senão pelo nvm, que não precisa de sudo
+# e passa na frente de um Node antigo do sistema (apt) sem mexer nele.
+node_new=0
+install_node() {
+  if command -v brew >/dev/null; then
+    brew install node || brew upgrade node || return 1
+  else
+    export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+    if [[ ! -s $NVM_DIR/nvm.sh ]]; then
+      local nvm_url=https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh
+      if command -v curl >/dev/null; then curl -fsSL "$nvm_url" | bash || return 1
+      elif command -v wget >/dev/null; then wget -qO- "$nvm_url" | bash || return 1
+      else sys_install curl && curl -fsSL "$nvm_url" | bash || return 1; fi
+    fi
+    # o nvm.sh não foi escrito para "set -euo pipefail"
+    set +euo pipefail
+    # shellcheck disable=SC1091
+    . "$NVM_DIR/nvm.sh" && nvm install --lts && nvm alias default 'lts/*'
+    local rc=$?
+    set -euo pipefail
+    [[ $rc -eq 0 ]] || return 1
+  fi
+  hash -r
+  node_new=1
+}
+node_major() { node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0; }
+
 spin "Node.js"
-if command -v node >/dev/null; then
-  node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
-  if [[ $node_major -ge 18 ]]; then ok "node" "$(node --version): o hub e a interface (/ui)"
-  else fail "node $(node --version)" "o hub precisa do Node.js 18 ou mais novo: https://nodejs.org"; exit 1; fi
-else
-  fail "node não encontrado" "o hub precisa do Node.js 18 ou mais novo: https://nodejs.org"
-  exit 1
+if ! command -v node >/dev/null; then
+  warn "node não encontrado" "o hub precisa do Node.js 18 ou mais novo"
+  if confirm "Instalar o Node.js LTS agora?" && install_node && command -v node >/dev/null; then :
+  else fail "sem Node.js" "instale em https://nodejs.org (ou com nvm: nvm install --lts) e rode de novo"; exit 1; fi
+elif [[ $(node_major) -lt 18 ]]; then
+  warn "node $(node --version)" "antigo demais: o hub precisa do Node.js 18 ou mais novo"
+  if confirm "Instalar o Node.js LTS agora?" && install_node && [[ $(node_major) -ge 18 ]]; then :
+  else fail "Node.js antigo" "atualize em https://nodejs.org (ou com nvm: nvm install --lts) e rode de novo"; exit 1; fi
 fi
+ok "node" "$(node --version): o hub e a interface (/ui)"
+# as CLIs instaladas pelo npm pedem Node mais novo que o hub; quando não der, o /install usa o instalador oficial de cada uma
+[[ $(node_major) -ge 22 ]] || printf '    %sNode %s: Claude e Gemini pelo npm pedem Node 20/22+; o hub usa o instalador oficial quando existir%s\n' "$GRAY" "$(node --version)" "$N"
 spin "npm"
 if command -v npm >/dev/null; then ok "npm" "$(npm --version): instala e atualiza as CLIs"; else warn "npm não encontrado" "necessário para /install e /update"; fi
 spin "git"
-if command -v git >/dev/null; then ok "git" "$(git --version | cut -d' ' -f3): atualizações do hub"; else warn "git não encontrado" "sem ele o hub não se atualiza sozinho"; fi
+if ! command -v git >/dev/null; then
+  warn "git não encontrado" "sem ele o hub não se atualiza sozinho nem instala skills"
+  if [[ $SYS_KIND == macos ]] && ! command -v brew >/dev/null; then printf '    %sno macOS: xcode-select --install%s\n' "$GRAY" "$N"
+  elif confirm "Instalar o git agora?"; then sys_install git || warn "não consegui instalar o git" "instale pelo gerenciador de pacotes do sistema"; fi
+fi
+if command -v git >/dev/null; then ok "git" "$(git --version | cut -d' ' -f3): atualizações do hub"; fi
 spin "AWS CLI"
 if command -v aws >/dev/null; then ok "aws" "$(aws --version 2>&1 | cut -d' ' -f1): contas Bedrock"; else printf '  %s○%s aws %s\n' "$GRAY" "$N" "${GRAY}opcional: só para contas Bedrock${N}"; fi
 
@@ -207,14 +266,14 @@ case ":$PATH:" in
       warn "$(short "$BIN_DIR") não está no PATH" "no fish, rode: fish_add_path ~/.local/bin"
       not_in_path=1
     elif [[ -f $rc ]] && grep -qE '(\$HOME|~)/\.local/bin' "$rc"; then
-      ok "PATH já configurado em ${rc/#$HOME/\~}"
+      ok "PATH já configurado em ${rc/#$HOME/$TILDE}"
       need_reload=1
     elif [[ -t 0 ]]; then
       warn "$(short "$BIN_DIR") não está no PATH"
-      read -rp "    Adicionar ao ${rc/#$HOME/\~}? [S/n] " reply || reply=n
+      read -rp "    Adicionar ao ${rc/#$HOME/$TILDE}? [S/n] " reply || reply=n
       if [[ -z $reply || $reply == [sSyY]* ]]; then
         printf '\n# agent-hub\n%s\n' "$line" >>"$rc"
-        ok "adicionado em ${rc/#$HOME/\~}"
+        ok "adicionado em ${rc/#$HOME/$TILDE}"
         need_reload=1
       else
         warn "pulado" "adicione manualmente: $line"
@@ -231,7 +290,7 @@ section "4. Suas contas"
 spin "lendo a configuração"
 if [[ -f $CONFIG ]]; then
   count=$(grep -c '^\[' "$CONFIG" || true)
-  ok "$count conta(s) cadastrada(s)" "${CONFIG/#$HOME/\~}"
+  ok "$count conta(s) cadastrada(s)" "${CONFIG/#$HOME/$TILDE}"
 else
   printf '  %s○%s nenhuma conta ainda %s\n' "$GRAY" "$N" "${GRAY}· você cadastra pelo /ui${N}"
 fi
@@ -241,8 +300,11 @@ echo
 mascot "◕ ◡ ◕" "${GREEN}${B}Pronto!${N} O hub está instalado." "${GRAY}próximos passos:${N}"
 echo
 step=1
+if ((node_new)) && ! ((need_reload)); then
+  printf '  %s%d%s  %sabra um terminal novo%s  %s(o Node.js foi instalado agora)%s\n' "$TEAL" $((step++)) "$N" "$B" "$N" "$GRAY" "$N"
+fi
 if ((need_reload)); then
-  printf '  %s%d%s  %ssource %s%s  %s(ou abra um terminal novo)%s\n' "$TEAL" $((step++)) "$N" "$B" "${rc/#$HOME/\~}" "$N" "$GRAY" "$N"
+  printf '  %s%d%s  %ssource %s%s  %s(ou abra um terminal novo)%s\n' "$TEAL" $((step++)) "$N" "$B" "${rc/#$HOME/$TILDE}" "$N" "$GRAY" "$N"
 elif ((not_in_path)); then
   printf '  %s%d%s  %sexport PATH="$HOME/.local/bin:$PATH"%s  %s(sem isso o comando hub não é encontrado)%s\n' "$TEAL" $((step++)) "$N" "$B" "$N" "$GRAY" "$N"
 fi

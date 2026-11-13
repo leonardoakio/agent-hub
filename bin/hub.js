@@ -388,9 +388,10 @@ function nameWidth() {
   return w > 24 ? 24 : w;
 }
 
-function nodeOk(cmd) {
+function nodeOk(cmd, method) {
   const min = lib.NODE_MIN[cmd];
-  if (!min || NODE_MAJOR >= min) return true;
+  // só importa quando a CLI roda no Node da máquina (npm & cia.); binário nativo, brew e winget trazem o próprio runtime
+  if (!min || NODE_MAJOR >= min || (method && method !== 'config' && !lib.PKG_METHODS.includes(method))) return true;
   echo(`${RED}✗${N} ${cmd} precisa do Node.js ${min} ou mais novo (você está no v${process.versions.node}).`);
   echo(`  ${GRAY}com nvm: nvm install ${min} && nvm alias default ${min} · depois abra um terminal novo${N}`);
   return false;
@@ -399,8 +400,10 @@ function nodeOk(cmd) {
 async function installMissing(names = [], opts = {}) {
   for (const n of names) if (!byName.has(n)) { warnErr(`${RED}✗${N} conta desconhecida: ${n}`); return 1; }
   const miss = missing(names);
-  const todo = miss.filter((a) => lib.installCmd(a));
-  const manual = miss.filter((a) => !lib.installCmd(a));
+  const how = new Map();
+  for (const a of miss) how.set(a, await lib.resolveInstall(a, null));
+  const todo = miss.filter((a) => how.get(a).cmd);
+  const manual = miss.filter((a) => !how.get(a).cmd);
   if (!ACC.length) {
     echo(`${YEL}!${N} nenhuma conta cadastrada: cadastre pela interface (${B}/ui${N} no menu)`);
     return 0;
@@ -409,26 +412,40 @@ async function installMissing(names = [], opts = {}) {
     echo(`${GREEN}✓${N} todas as CLIs cadastradas já estão instaladas`);
     return 0;
   }
-  for (const a of manual) echo(`${YEL}!${N} ${a.command} (${a.name}): sem instalador conhecido: instale manualmente ou defina ${B}install = …${N} no config`);
+  for (const a of manual) echo(`${YEL}!${N} ${a.command} (${a.name}): ${how.get(a).note || `sem instalador conhecido: instale manualmente ou defina ${B}install = …${N} no config`}`);
   if (!todo.length) return 0;
   echo(`${B}Vou instalar:${N}`);
-  for (const a of todo) echo(`  ${padEnd(a.command, 8)} ${GRAY}${lib.installCmd(a)}${N}`);
+  for (const a of todo) {
+    const h = how.get(a);
+    echo(`  ${padEnd(a.command, 8)} ${GRAY}via ${h.label}: ${h.cmd}${N}`);
+    if (h.note) echo(`  ${' '.repeat(8)} ${YEL}${h.note}${N}`);
+  }
   if (!process.env.HUB_YES && !opts.yes && !(await ask('Continuar?'))) {
     echo('cancelado');
     return 1;
   }
   for (const a of todo) {
-    const cmd = lib.installCmd(a);
-    if (/^npm /.test(cmd) && !findExe('npm')) { echo(`${RED}✗${N} ${a.command}: precisa do Node.js/npm (https://nodejs.org)`); continue; }
+    const h = how.get(a);
+    const cmd = h.cmd;
+    if (/^(sudo )?npm /.test(cmd) && !findExe('npm')) { echo(`${RED}✗${N} ${a.command}: precisa do Node.js/npm (https://nodejs.org)`); continue; }
     if (/^curl /.test(cmd) && !findExe('curl')) { echo(`${RED}✗${N} ${a.command}: precisa do curl`); continue; }
     if (/^powershell /i.test(cmd) && !findExe('powershell')) { echo(`${RED}✗${N} ${a.command}: precisa do PowerShell`); continue; }
-    if (!nodeOk(a.command)) continue;
+    if (/^brew /.test(cmd) && !findExe('brew')) { echo(`${RED}✗${N} ${a.command}: precisa do Homebrew (https://brew.sh)`); continue; }
+    if (/^winget /.test(cmd) && !findExe('winget')) { echo(`${RED}✗${N} ${a.command}: precisa do winget`); continue; }
+    if (!nodeOk(a.command, h.method)) continue;
     echo(`${TEAL}→${N} ${cmd}`);
-    if ((await runShellLine(cmd, process.env)) === 0) echo(`${GREEN}✓${N} ${a.command} instalado: no primeiro uso, faça login dentro dele`);
-    else echo(`${RED}✗${N} falhou ao instalar ${a.command}`);
+    if ((await runShellLine(cmd, process.env)) !== 0) { echo(`${RED}✗${N} falhou ao instalar ${a.command}${h.needsSudo ? `\n  ${GRAY}${h.note}${N}` : ''}`); continue; }
+    if (installed(a)) echo(`${GREEN}✓${N} ${a.command} instalado via ${h.label}: no primeiro uso, faça login dentro dele`);
+    else {
+      const dir = h.method === 'native' ? '~/.local/bin' : h.method === 'npm' ? 'a pasta bin do npm global' : 'a pasta de instalação';
+      echo(`${YEL}!${N} ${a.command} instalado via ${h.label}, mas ainda não aparece no PATH: abra um terminal novo (ou adicione ${dir} ao PATH) e rode ${B}hub${N} de novo`);
+    }
   }
   return 0;
 }
+
+// Como a conta foi instalada, a partir do executável que este terminal enxerga no PATH.
+const howInstalled = (a) => lib.resolveInstall(a, lib.installInfoFrom(a.command, findExe(a.command)));
 
 async function versionOf(cmd) {
   const r = await lib.run(cmd, ['--version'], 10000);
@@ -455,18 +472,22 @@ async function updateInstalled(names = []) {
       echo(`${TEAL}→${N} agy ${GRAY}(${(await versionOf('agy')) || 'versão desconhecida'})${N}  ${GRAY}se atualiza sozinho em segundo plano ao ser usado${N}`);
       continue;
     }
-    const cmd = lib.installCmd(a);
-    if (!cmd) { echo(`${YEL}!${N} ${a.command}: sem comando de instalação: defina ${B}install = …${N} no config`); continue; }
-    if (!nodeOk(a.command)) continue;
+    // atualiza pelo mesmo meio em que a CLI foi instalada (npm, Homebrew, instalador oficial…)
+    const h = await howInstalled(a);
     const before = await versionOf(a.command);
-    echo(`${TEAL}→${N} ${a.command} ${GRAY}(${before || 'versão desconhecida'})${N}  ${GRAY}${cmd}${N}`);
-    const r = await lib.runShell(cmd, 30 * 60 * 1000);
-    if (r.ok) {
+    echo(`${TEAL}→${N} ${a.command} ${GRAY}(${before || 'versão desconhecida'} · ${h.label}${h.path ? ` · ${lib.homeRel(h.path)}` : ''})${N}`);
+    if (!h.cmd) { echo(`  ${YEL}!${N} ${h.note || `sem comando de atualização: defina ${B}install = …${N} no config`}`); continue; }
+    if (!nodeOk(a.command, h.method)) continue;
+    echo(`  ${GRAY}${h.cmd}${N}`);
+    if (h.needsSudo) echo(`  ${YEL}!${N} ${h.note}`);
+    // saída ao vivo: dá para ver o erro real e digitar a senha do sudo se precisar
+    const code = await runShellLine(h.cmd, process.env);
+    if (code === 0) {
       const after = await versionOf(a.command);
       if (before && before === after) echo(`  ${GREEN}✓${N} já estava na mais recente (${after})`);
       else echo(`  ${GREEN}✓${N} atualizado: ${before || '?'} → ${B}${after || '?'}${N}`);
     } else {
-      echo(`  ${RED}✗${N} falhou: rode manualmente: ${cmd}`);
+      echo(`  ${RED}✗${N} falhou (código ${code}): veja o erro acima${h.needsSudo ? '' : ` ou rode manualmente: ${h.cmd}`}`);
     }
   }
   return 0;
@@ -596,38 +617,67 @@ async function skillRun(skill, names) {
   return code;
 }
 
-async function skillInstallDeps(folders) {
+async function skillInstallDeps(folders, source = '') {
+  const opts = source ? { source } : {};
   let r;
-  try { r = await lib.checkDeps(folders); } catch { r = { deps: [] }; }
-  if (!r.deps.length) { out(`    ${GRAY}nenhuma dependência extra${N}\n`); return; }
-  for (const d of r.deps) {
-    if (d.ok) out(`    ${GREEN}✓${N} ${d.label}\n`);
-    else if (d.optional) out(`    ${GRAY}○${N} ${d.label} ${GRAY}(opcional)${N}\n`);
-    else out(`    ${RED}✗${N} ${d.label}\n`);
+  try { r = await lib.checkDeps(folders, opts); } catch (e) { r = { deps: [], steps: [], compat: {}, origin: {} }; out(`    ${YEL}!${N} não consegui conferir as dependências: ${e.message}\n`); }
+  const steps = Array.isArray(r.steps) ? r.steps : [];
+  for (const [f, text] of Object.entries(r.compat || {})) out(`    ${GRAY}${folders.length > 1 ? `${f}: ` : ''}compatibilidade declarada: ${plain(text).slice(0, 200)}${N}\n`);
+  if (!r.deps.length) {
+    const inferred = Object.values(r.origin || {}).includes('inferida');
+    out(`    ${GRAY}${inferred ? 'nenhuma dependência encontrada nos arquivos da skill' : 'nenhuma dependência extra'}${N}\n`);
+  } else {
+    if (r.inferred) out(`    ${GRAY}deduzidas dos arquivos da skill (manifestos, scripts e SKILL.md)${N}\n`);
+    for (const d of r.deps) {
+      const why = d.inferred && d.evidence && d.evidence.length ? ` ${GRAY}· ${plain(d.evidence[0]).slice(0, 70)}${N}` : '';
+      if (d.ok) out(`    ${GREEN}✓${N} ${d.label}${why}\n`);
+      else if (d.optional) out(`    ${GRAY}○${N} ${d.label} ${GRAY}(opcional)${N}${why}\n`);
+      else out(`    ${RED}✗${N} ${d.label}${why}\n`);
+    }
   }
+  if (steps.length) {
+    out(`    ${B}Depois de instalar${N} ${GRAY}(o SKILL.md pede; o hub não faz sozinho)${N}\n`);
+    for (const s of steps) out(`    ${YEL}·${N} ${folders.length > 1 ? `${s.skill}: ` : ''}${plain(s.title)}${s.cmd ? ` ${GRAY}→ ${plain(s.cmd)}${N}` : ''}${s.detail ? ` ${GRAY}(${plain(s.detail)})${N}` : ''}\n`);
+  }
+  if (!r.deps.length) return;
   const need = r.deps.filter((d) => !d.ok && !d.optional);
   for (const d of need.filter((x) => x.how === 'manual')) {
-    const why = d.type === 'py' ? `${d.label} (precisa do pip: python3 -m ensurepip --user)`
-      : d.type === 'bin' && IS_MAC ? `${d.label} (instale o Homebrew em https://brew.sh e rode /skills de novo)`
-        : `${d.label} (pelo gerenciador de pacotes do seu sistema${d.apt ? `, pacote parecido com ${d.apt}` : ''})`;
+    const why = d.manual ? `${d.label}: ${d.manual}`
+      : d.type === 'py' ? `${d.label} (precisa do pip: python3 -m ensurepip --user)`
+        : d.type === 'npm' ? `${d.label} (precisa do Node.js/npm: https://nodejs.org)`
+          : d.type === 'bin' && IS_MAC ? `${d.label} (instale o Homebrew em https://brew.sh e rode /skills de novo)`
+            : `${d.label} (pelo gerenciador de pacotes do seu sistema${d.apt ? `, pacote parecido com ${d.apt}` : ''})`;
     out(`    ${YEL}!${N} instale à parte: ${why}\n`);
   }
-  const viaLib = need.some((d) => ['pip', 'npm', 'brew', 'needs-pip'].includes(d.how));
-  if (!r.aptCommand && !viaLib) return;
+  const viaLib = need.some((d) => ['pip', 'npm', 'brew'].includes(d.how));
+  const sysArgs = Array.isArray(r.sysArgs) ? r.sysArgs : [];
+  const npmArgs = Array.isArray(r.npmArgs) ? r.npmArgs : [];
+  if (!sysArgs.length && !npmArgs.length && !viaLib) return;
   echo();
   if (!(await ask('  Instalar as dependências que faltam antes da skill?'))) {
     out(`  ${YEL}!${N} seguindo sem elas: a skill pode não funcionar por completo\n`);
     return;
   }
-  if (r.aptCommand) {
-    const pkgs = splitWords(r.aptCommand.replace(/^sudo apt install -y\s*/, ''));
-    out(`  ${TEAL}→${N} programas do sistema: ${B}${r.aptCommand}${N}\n`);
-    if ((await runCli('sudo', ['apt', 'install', '-y', ...pkgs], process.env)) === 0) out(`  ${GREEN}✓${N} programas do sistema instalados\n`);
-    else out(`  ${RED}✗${N} não consegui instalar os programas do sistema\n`);
+  // programas do sistema: apt, dnf, zypper, pacman, apk (com sudo) ou winget (sem sudo); saída ao vivo para a senha
+  if (sysArgs.length) {
+    out(`  ${TEAL}→${N} programas do sistema: ${B}${r.sysCommand}${N}\n`);
+    const code = r.sysSudo ? await runCli('sudo', sysArgs, process.env) : await runCli(sysArgs[0], sysArgs.slice(1), process.env);
+    if (code === 0) out(`  ${GREEN}✓${N} programas do sistema instalados\n`);
+    else out(`  ${RED}✗${N} não consegui instalar os programas do sistema (código ${code})\n`);
+    if (need.some((d) => d.how === 'needs-pip')) {
+      // agora com pip, os módulos Python podem entrar pelo hub
+      try { r = await lib.checkDeps(folders, opts); } catch { r = { deps: [] }; }
+    }
   }
-  if (viaLib) {
+  // pacotes Node com npm global do root
+  if (npmArgs.length) {
+    out(`  ${TEAL}→${N} pacotes Node: ${B}${r.npmCommand}${N}\n`);
+    if ((await runCli('sudo', npmArgs, process.env)) === 0) out(`  ${GREEN}✓${N} pacotes Node instalados\n`);
+    else out(`  ${RED}✗${N} não consegui instalar os pacotes Node\n`);
+  }
+  if (viaLib || r.deps.some((d) => !d.ok && !d.optional && d.how === 'pip')) {
     let res;
-    try { res = await spinRun('instalando as dependências…', lib.installDeps(folders)); } catch (e) { res = { log: [`falhou: ${e.message}`] }; }
+    try { res = await spinRun('instalando as dependências…', lib.installDeps(folders, false, opts)); } catch (e) { res = { log: [`falhou: ${e.message}`] }; }
     for (const l of res.log || []) out(`  ${/falhou/.test(l) ? `${RED}✗` : `${GREEN}✓`}${N} ${l}\n`);
   }
 }
@@ -713,11 +763,13 @@ async function installSkillFrom(src, T) {
     }
     echo(`  encontrada(s): ${B}${found.map((s) => plain(s.folder) + ' ').join('')}${N}`);
     echo(`  versão:        ${fetched.commit} · ${fetched.date} ${GRAY}(a mais recente, baixada agora)${N}`);
+    const licenses = [...new Set(found.map((s) => plain(String(s.license || '')).trim()).filter(Boolean))];
+    if (licenses.length) echo(`  licença:       ${licenses.join(', ')} ${GRAY}(declarada no SKILL.md)${N}`);
     echo(`  instalar em:   ${T.map((t) => t.label).join(' · ')}`);
     const folders = found.map((s) => s.folder);
     echo();
     out(`  ${B}Dependências${N}\n`);
-    await skillInstallDeps(folders);
+    await skillInstallDeps(folders, src);
     echo();
     if (!(await ask('  Instalar a skill?'))) { echo('cancelado'); return 0; }
     for (const f of folders.filter((x) => !SKILL_NAME_RE.test(x))) echo(`${YEL}!${N} nome inválido, pulando: ${f}`);
@@ -891,14 +943,17 @@ async function check() {
   const rows = await Promise.all(ACC.map(async (a) => {
     const inst = installed(a);
     const version = inst ? first(await lib.run(a.command, ['--version'], 15000)) : '';
+    const how = await howInstalled(a);
     const profile = envVal(a, 'AWS_PROFILE');
     let aws = null;
     if (profile && hasAws) aws = (await lib.run('aws', ['sts', 'get-caller-identity'], 20000, Object.fromEntries(a.envList))).ok;
-    return { a, inst, version, profile, aws };
+    return { a, inst, version, profile, aws, how };
   }));
-  for (const { a, inst, version, profile, aws } of rows) {
-    if (inst) out(`  ${GREEN}✓${N} ${padEnd(a.name, nw)} ${padEnd(a.command, 8)} ${GRAY}${version}${N}\n`);
-    else out(`  ${RED}✗${N} ${padEnd(a.name, nw)} ${padEnd(a.command, 8)} ${GRAY}não instalado (${lib.installCmd(a) || 'sem instalador conhecido'})${N}\n`);
+  for (const { a, inst, version, profile, aws, how } of rows) {
+    if (inst) {
+      out(`  ${GREEN}✓${N} ${padEnd(a.name, nw)} ${padEnd(a.command, 8)} ${GRAY}${version} · ${how.label}${how.path ? ` · ${lib.homeRel(how.path)}` : ''}${N}\n`);
+      if (how.note) out(`    ${' '.repeat(nw)} ${YEL}${how.note}${N}\n`);
+    } else out(`  ${RED}✗${N} ${padEnd(a.name, nw)} ${padEnd(a.command, 8)} ${GRAY}não instalado (${how.cmd ? `via ${how.label}: ${how.cmd}` : how.note || 'sem instalador conhecido'})${N}\n`);
     if (!profile) continue;
     if (!hasAws) out(`    ${' '.repeat(nw)} ${RED}aws CLI não instalado${N}\n`);
     else if (aws) out(`    ${' '.repeat(nw)} aws perfil "${profile}": ${GREEN}credenciais ok${N}\n`);

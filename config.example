@@ -7,7 +7,9 @@
 #   command = CLI que será aberta
 #   args    = argumentos fixos (opcional)
 #   env     = variáveis VAR=valor separadas por espaço (opcional)
-#   install = comando que instala/atualiza a CLI (opcional; claude, codex, gemini, copilot e agy já têm um)
+#   install = comando que instala/atualiza a CLI (opcional)
+#             sem ele, o hub detecta por onde a CLI foi instalada (npm, pnpm, Yarn, Bun, Homebrew,
+#             instalador oficial, winget) e atualiza pelo mesmo meio; o campo força um comando fixo
 #             roda no bash (Linux/macOS/WSL) ou no cmd.exe (Windows)
 #
 # ~ vale como a pasta do seu usuário (no Windows, %USERPROFILE%), em command, args e env.

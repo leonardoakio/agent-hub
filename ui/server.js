@@ -93,7 +93,7 @@ async function systemDetails() {
       { what: 'Antigravity (agy)', where: agyBin },
       ...skillTargets().map((t) => ({ what: `Skills · ${t.accounts.map((a) => a.label).join(', ') || t.tool}`, where: t.dir })),
     ].map((x) => ({ ...x, where: homeRel(x.where) })),
-    installWith: IS_WIN ? 'cmd.exe (npm) e PowerShell (Antigravity)' : 'bash (npm e script oficial do Antigravity)',
+    installWith: IS_WIN ? 'cmd.exe e PowerShell, pelo mesmo meio em que cada CLI já foi instalada' : 'bash, pelo mesmo meio em que cada CLI já foi instalada (npm, Homebrew, instalador oficial…)',
   };
 }
 const CONFIG =
@@ -107,17 +107,147 @@ const INDEX = path.join(__dirname, 'index.html');
 const FIELDS = ['type', 'label', 'command', 'args', 'install'];
 const API_VERSION = 1;
 const TYPES = ['claude', 'bedrock', 'codex', 'gemini', 'antigravity', 'copilot', 'custom'];
-const DEFAULT_INSTALL = {
-  claude: 'npm install -g @anthropic-ai/claude-code@latest',
-  codex: 'npm install -g @openai/codex@latest',
-  gemini: 'npm install -g @google/gemini-cli@latest',
-  copilot: 'npm install -g @github/copilot@latest',
-  agy: IS_WIN ? 'powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://antigravity.google/cli/install.ps1 | iex"'
-    : 'curl -fsSL https://antigravity.google/cli/install.sh | bash',
+// Meios pelos quais cada CLI pode ter sido instalada. O hub descobre qual foi usado olhando onde o
+// executável está e atualiza pelo mesmo meio, em vez de assumir npm para tudo.
+const PS1 = (line) => `powershell -NoProfile -ExecutionPolicy Bypass -Command "${line}"`;
+const INSTALL_WAYS = {
+  claude: {
+    npm: '@anthropic-ai/claude-code',
+    brew: { cask: 'claude-code' },
+    native: { install: IS_WIN ? PS1('irm https://claude.ai/install.ps1 | iex') : 'curl -fsSL https://claude.ai/install.sh | bash', update: 'claude update' },
+    winget: 'Anthropic.ClaudeCode',
+  },
+  codex: { npm: '@openai/codex', brew: { cask: 'codex' }, winget: 'OpenAI.Codex', binary: 'https://github.com/openai/codex/releases' },
+  gemini: { npm: '@google/gemini-cli', brew: { formula: 'gemini-cli' } },
+  copilot: {
+    npm: '@github/copilot',
+    brew: { cask: 'copilot-cli' },
+    native: IS_WIN ? null : { install: 'curl -fsSL https://gh.io/copilot-install | bash' },
+    winget: 'GitHub.Copilot',
+  },
+  agy: { native: { install: IS_WIN ? PS1('irm https://antigravity.google/cli/install.ps1 | iex') : 'curl -fsSL https://antigravity.google/cli/install.sh | bash' } },
 };
+const METHOD_LABEL = {
+  npm: 'npm', pnpm: 'pnpm', yarn: 'Yarn', bun: 'Bun', brew: 'Homebrew', native: 'instalador oficial',
+  winget: 'winget', scoop: 'Scoop', binary: 'binário avulso', config: 'comando do config',
+};
+const PKG_METHODS = ['npm', 'pnpm', 'yarn', 'bun'];
+// Instalação padrão para quem ainda não tem a CLI: npm continua sendo o primeiro, mas sem npm na máquina vale o instalador oficial.
+const DEFAULT_INSTALL = Object.fromEntries(Object.keys(INSTALL_WAYS).map((c) => [c, wayCmd(c, INSTALL_WAYS[c].npm ? 'npm' : 'native', 'install')]));
 // O agy se atualiza sozinho; rodar o script de novo não faz nada.
 const SELF_UPDATING = { agy: 'O Antigravity se atualiza sozinho em segundo plano ao ser usado.' };
 const NODE_MIN = { copilot: 22 };
+
+// Comando que instala (verb = 'install') ou atualiza (verb = 'update') a CLI por um meio. Vazio quando o meio não tem comando.
+function wayCmd(cmd, method, verb) {
+  const ways = INSTALL_WAYS[cmd];
+  if (!ways) return '';
+  if (PKG_METHODS.includes(method)) {
+    // pnpm, Yarn e Bun instalam o mesmo pacote do npm
+    const pkg = ways.npm;
+    if (!pkg) return '';
+    return { npm: `npm install -g ${pkg}@latest`, pnpm: `pnpm add -g ${pkg}@latest`, yarn: `yarn global add ${pkg}@latest`, bun: `bun add -g ${pkg}@latest` }[method];
+  }
+  const way = ways[method];
+  if (!way) return '';
+  if (method === 'brew') return way.cask ? `brew ${verb === 'update' ? 'upgrade' : 'install'} --cask ${way.cask}` : `brew ${verb === 'update' ? 'upgrade' : 'install'} ${way.formula}`;
+  if (method === 'native') return (verb === 'update' && way.update) || way.install || '';
+  if (method === 'winget') return `winget ${verb === 'update' ? 'upgrade' : 'install'} --id ${way} -e`;
+  return '';
+}
+
+// Deduz o meio de instalação pelo caminho do executável (e pelo que ele aponta).
+function classifyInstall(cmd, exe) {
+  let real = exe;
+  try { real = fs.realpathSync(exe); } catch {}
+  const s = `${exe}\n${real}`.replace(/\\/g, '/');
+  const home = HOME.replace(/\\/g, '/');
+  if (/\/(Cellar|Caskroom)\//.test(s)) return { method: 'brew', real };
+  if (/\/(\.pnpm|pnpm)\//.test(s)) return { method: 'pnpm', real };
+  if (/\/\.bun\//.test(s)) return { method: 'bun', real };
+  if (/\/(\.yarn|yarn\/global)\//.test(s)) return { method: 'yarn', real };
+  if (/\/node_modules\//.test(s) || /\/\.volta\//.test(s) || fs.existsSync(path.join(path.dirname(exe), 'node_modules'))) return { method: 'npm', real };
+  if (/\/winget\//i.test(s)) return { method: 'winget', real };
+  if (/\/scoop\//i.test(s)) return { method: 'scoop', real };
+  if (cmd === 'agy') return { method: 'native', real };
+  if (cmd === 'claude' && (s.includes(`${home}/.local/share/claude/`) || /\/\.local\/bin\/claude(\.exe)?$/i.test(s))) return { method: 'native', real };
+  if (cmd === 'copilot' && /\/(\.local|usr\/local)\/bin\/copilot(\.exe)?$/i.test(s)) return { method: 'native', real };
+  return { method: 'binary', real };
+}
+
+let npmPrefixCache;
+function npmPrefix() {
+  if (npmPrefixCache === undefined) {
+    npmPrefixCache = (async () => {
+      const g = (await which('npm')) ? await run('npm', ['config', 'get', 'prefix'], 10000) : { ok: false };
+      return g.ok ? g.stdout.trim() : '';
+    })().catch(() => '');
+  }
+  return npmPrefixCache;
+}
+// O npm global do sistema (/usr, /usr/local) costuma ser do root: aí o install -g só funciona com sudo ou mudando o prefixo.
+async function npmNeedsSudo() {
+  if (IS_WIN) return false;
+  const prefix = await npmPrefix();
+  if (!prefix) return false;
+  const dir = npmModDir(prefix);
+  const target = fs.existsSync(dir) ? dir : fs.existsSync(path.join(prefix, 'lib')) ? path.join(prefix, 'lib') : prefix;
+  try { fs.accessSync(target, fs.constants.W_OK); return false; } catch { return true; }
+}
+const NPM_PREFIX_HINT = 'ou mude o prefixo do npm para a sua pasta: npm config set prefix ~/.npm-global (e coloque ~/.npm-global/bin no PATH)';
+
+// Onde a CLI está e por que meio foi instalada. null quando não está instalada.
+function installInfoFrom(cmd, exe) {
+  if (!exe) return null;
+  const { method, real } = classifyInstall(cmd, exe);
+  return { path: exe, real, method, label: METHOD_LABEL[method] || method };
+}
+async function installInfo(cmd) {
+  return installInfoFrom(cmd, (await whichAll(cmd))[0]);
+}
+async function installInfos(accounts) {
+  const cmds = [...new Set(['claude', 'codex', 'gemini', 'agy', 'copilot', ...accounts.map((a) => a.command)])];
+  const result = {};
+  await Promise.all(cmds.map(async (c) => { result[c] = await installInfo(c); }));
+  return result;
+}
+
+// Decide como instalar ou atualizar uma conta: o campo install do config vale sempre; senão, o meio detectado;
+// senão, o meio padrão disponível na máquina. info pode vir pré-calculado (null = não instalada).
+async function resolveInstall(a, info) {
+  if (a.install) return { cmd: a.install, method: 'config', label: METHOD_LABEL.config, verb: 'install', needsSudo: false, note: '' };
+  const ways = INSTALL_WAYS[a.command];
+  if (!ways) return { cmd: '', method: '', label: '', verb: 'install', needsSudo: false, note: `sem instalador conhecido para ${a.command}: defina install = … no config` };
+  if (info === undefined) info = await installInfo(a.command);
+  const res = { cmd: '', method: '', label: '', verb: info ? 'update' : 'install', needsSudo: false, note: '', path: info ? info.path : '' };
+  if (!info) {
+    // npm primeiro; mas se o npm global for do root e houver outro meio na máquina, ele passa a ser a última opção
+    const order = [['npm', 'npm'], ['native', IS_WIN ? 'powershell' : 'curl'], ['brew', 'brew'], ['winget', 'winget']];
+    if (ways.npm && (await npmNeedsSudo())) order.push(order.shift());
+    let pick = '';
+    for (const [m, tool] of order) if (ways[m] && (await which(tool))) { pick = m; break; }
+    if (!pick) pick = ways.npm ? 'npm' : 'native';
+    res.method = pick;
+    res.cmd = wayCmd(a.command, pick, 'install');
+  } else {
+    res.method = info.method;
+    res.cmd = wayCmd(a.command, info.method, 'update');
+    if (!res.cmd) {
+      const site = typeof ways.binary === 'string' ? ways.binary : '';
+      res.note = info.method === 'binary'
+        ? `instalada como binário avulso em ${homeRel(info.path)}: baixe a versão nova${site ? ` em ${site}` : ''} e substitua o arquivo`
+        : `instalada via ${METHOD_LABEL[info.method] || info.method} em ${homeRel(info.path)}: atualize por lá ou defina install = … no config`;
+    }
+  }
+  res.label = METHOD_LABEL[res.method] || res.method;
+  if (res.method === 'npm' && res.cmd && (await npmNeedsSudo())) {
+    res.needsSudo = true;
+    res.cmd = `sudo ${res.cmd}`;
+    res.note = `o npm global (${await npmPrefix()}) é do root: precisa de sudo, ${NPM_PREFIX_HINT}`;
+  }
+  return res;
+}
+// Compatibilidade: comando "estático" (config ou padrão), sem olhar a máquina.
 const installCmd = (a) => a.install || DEFAULT_INSTALL[a.command] || '';
 
 function inferType(a) {
@@ -461,13 +591,9 @@ async function testAwsProfile(name) {
 }
 
 async function installed(accounts) {
-  const cmds = [...new Set(['claude', 'codex', 'gemini', 'agy', 'copilot', 'aws', ...accounts.map((a) => a.command)])];
-  const result = {};
-  await Promise.all(
-    cmds.map(async (c) => {
-      result[c] = await which(c);
-    }),
-  );
+  const infos = await installInfos(accounts);
+  const result = { aws: await which('aws') };
+  for (const [c, info] of Object.entries(infos)) result[c] = Boolean(info);
   return result;
 }
 
@@ -530,7 +656,7 @@ function skillMeta(dir) {
   if (!source && lock?.source && (!lock.sourceType || lock.sourceType === 'github')) { source = lock.source; origin = 'npx skills'; version = version || (lock.updatedAt ? `instalada em ${lock.updatedAt.slice(0, 10)}` : ''); }
   let linked = false;
   try { linked = fs.lstatSync(dir).isSymbolicLink(); } catch {}
-  return { name: get('name') || folder, description: get('description'), source, version, origin, linked };
+  return { name: get('name') || folder, description: get('description'), license: get('license'), compatibility: get('compatibility'), source, version, origin, linked };
 }
 
 function skillTargets() {
@@ -586,12 +712,15 @@ async function fetchSource(src, { fresh = false } = {}) {
   const cached = sourceCache.get(key);
   if (!fresh && cached && Date.now() - cached.at < 10 * 60 * 1000 && fs.existsSync(cached.dir)) return { label, ...filterSub(cached, sub) };
   if (cached) { retireSource(cached); sourceCache.delete(key); }
+  if (!(await which('git'))) throw new Error(`git não está instalado: as skills vêm do GitHub por ele (${IS_WIN ? 'winget install --id Git.Git -e' : IS_MAC ? 'xcode-select --install' : 'sudo apt install git'})`);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-skill-'));
   const r = await run('git', ['clone', '--depth', '1', '--quiet', ...(branch ? ['--branch', branch] : []), url, dir], 120000,
     { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_ASKPASS: 'true' });
   if (!r.ok) {
     fs.rmSync(dir, { recursive: true, force: true });
-    const why = /could not read Username|Authentication failed|not found/i.test(r.stderr) ? 'repositório não encontrado ou privado' : r.stderr.split('\n').pop();
+    const why = /could not read Username|Authentication failed|not found/i.test(r.stderr) ? 'repositório não encontrado ou privado'
+      : /Could not resolve host|unable to access|Failed to connect|timed out/i.test(r.stderr) ? 'sem conexão com o GitHub (rede ou proxy)'
+        : r.code === null || /timed out/i.test(String(r.code)) ? 'demorou demais (rede lenta?)' : r.stderr.split('\n').filter(Boolean).pop();
     throw new Error(`não consegui baixar ${label}${branch ? ` (${branch})` : ''}: ${why || 'repositório não encontrado'}`);
   }
   const skills = [];
@@ -651,7 +780,8 @@ function readmeExcerpt(src, folders) {
     if (m && m[2].trim()) return { from: `README.md · seção ${f}`, text: limit(cleanMarkdown(m[2])) };
   }
   if (src.skills.length === 1) return { from: 'README.md · introdução', text: limit(cleanMarkdown(md.replace(/^#\s[^\n]*\n/, ''))) };
-  const sk = src.skills.find((x) => folders.includes(x.folder));
+  // várias skills pedidas: a introdução do repositório diz mais do que a documentação de uma skill qualquer
+  const sk = folders.length === 1 ? src.skills.find((x) => x.folder === folders[0]) : null;
   if (sk) {
     const body = (safeRead(path.join(sk.dir, 'SKILL.md')) || '').replace(/^---[\s\S]*?\n---\s*\n/, '');
     return { from: `${sk.folder}/SKILL.md (documentação da skill)`, text: limit(cleanMarkdown(body)) };
@@ -659,59 +789,341 @@ function readmeExcerpt(src, folders) {
   return { from: 'README.md · introdução', text: limit(cleanMarkdown(md.replace(/^#\s[^\n]*\n/, ''))) };
 }
 
-const DEP_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+// Pacotes npm podem ter escopo (@org/pacote); nomes só viram argumentos de execFile, nunca shell.
+const DEP_NAME_RE = /^(@[A-Za-z0-9._-]{1,64}\/)?[A-Za-z0-9._-]{1,64}$/;
+const PY_MOD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 
-function depsFor(folders) {
-  const seen = new Map();
-  const all = currentDeps();
-  for (const f of folders) for (const d of (Array.isArray(all[f]) ? all[f] : [])) {
-    const key = `${d.type}:${d.name}`;
-    const prev = seen.get(key);
-    if (prev) { prev.skills.push(f); if (!d.optional) prev.optional = false; continue; }
-    seen.set(key, { ...d, key, skills: [f], optional: Boolean(d.optional) });
+// ---- Inferência de dependências de uma skill desconhecida, pelos arquivos dela ----
+// Módulos da biblioteca padrão do Python (não são dependências).
+const PY_STDLIB = new Set(('__future__ _thread abc aifc argparse array ast asynchat asyncio asyncore atexit audioop base64 bdb binascii bisect builtins bz2 calendar cgi cgitb chunk cmath cmd code codecs codeop collections colorsys compileall concurrent configparser contextlib contextvars copy copyreg cProfile crypt csv ctypes curses dataclasses datetime dbm decimal difflib dis distutils doctest email encodings ensurepip enum errno faulthandler fcntl filecmp fileinput fnmatch fractions ftplib functools gc getopt getpass gettext glob graphlib grp gzip hashlib heapq hmac html http idlelib imaplib imghdr imp importlib inspect io ipaddress itertools json keyword lib2to3 linecache locale logging lzma mailbox mailcap marshal math mimetypes mmap modulefinder msilib msvcrt multiprocessing netrc nis nntplib numbers operator optparse os ossaudiodev pathlib pdb pickle pickletools pipes pkgutil platform plistlib poplib posix posixpath pprint profile pstats pty pwd py_compile pyclbr pydoc queue quopri random re readline reprlib resource rlcompleter runpy sched secrets select selectors shelve shlex shutil signal site smtpd smtplib sndhdr socket socketserver spwd sqlite3 ssl stat statistics string stringprep struct subprocess sunau symtable sys sysconfig syslog tabnanny tarfile telnetlib tempfile termios textwrap threading time timeit tkinter token tokenize tomllib trace traceback tracemalloc tty turtle turtledemo types typing typing_extensions unicodedata unittest urllib uu uuid venv warnings wave weakref webbrowser winreg winsound wsgiref xdrlib xml xmlrpc zipapp zipfile zipimport zlib zoneinfo ' +
+  'setuptools pkg_resources pip wheel ntpath nt').split(' '));
+// Módulo importado → pacote no pip, quando os nomes diferem.
+const PY_IMPORT_PKG = {
+  PIL: 'pillow', yaml: 'PyYAML', cv2: 'opencv-python', bs4: 'beautifulsoup4', sklearn: 'scikit-learn', skimage: 'scikit-image',
+  docx: 'python-docx', pptx: 'python-pptx', dateutil: 'python-dateutil', dotenv: 'python-dotenv', jwt: 'PyJWT', Crypto: 'pycryptodome',
+  nacl: 'pynacl', serial: 'pyserial', usb: 'pyusb', magic: 'python-magic', fitz: 'PyMuPDF', pymupdf: 'PyMuPDF', websocket: 'websocket-client',
+  attr: 'attrs', OpenSSL: 'pyopenssl', psycopg2: 'psycopg2-binary', MySQLdb: 'mysqlclient', markdown: 'Markdown', pdfminer: 'pdfminer.six',
+  wx: 'wxPython', gi: '', google: '', tests: '', test: '',
+};
+const PY_PKG_IMPORT = Object.fromEntries(Object.entries(PY_IMPORT_PKG).filter(([, v]) => v).map(([k, v]) => [v.toLowerCase(), k]));
+// Pacote do sistema → programa que fica no PATH (para conferir se já está instalado).
+const PKG_BIN = {
+  poppler: 'pdftoppm', 'poppler-utils': 'pdftoppm', libreoffice: 'soffice', 'libreoffice-fresh': 'soffice', ripgrep: 'rg', imagemagick: 'magick',
+  'tesseract-ocr': 'tesseract', graphviz: 'dot', nodejs: 'node', 'python3-pip': 'pip3', 'build-essential': 'gcc', coreutils: '', 'ca-certificates': '', 'libmagic1': '',
+};
+const PKG_LABEL = { pillow: 'Pillow', pyyaml: 'PyYAML' };
+const INFER_MAX_FILES = 400, INFER_MAX_BYTES = 512 * 1024;
+const SETUP_CMD_RE = /^(?:sudo\s+)?(?:(?:python3?|py)\s+-m\s+pip|pip3?|uv\s+pip|uv\s+(?:sync|tool\s+install|add)|npm|npx|pnpm|yarn|bun|brew|apt(?:-get)?|dnf|pacman|winget|choco|cargo|go|gem|playwright|poetry)\b/i;
+const ENV_VAR_RE = /\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:API_KEY|TOKEN|SECRET|ACCESS_KEY|CLIENT_ID|CLIENT_SECRET|PASSWORD|WEBHOOK))\b/g;
+
+const pipName = (spec) => String(spec).trim().replace(/^-e\s+/, '').replace(/\[.*$/, '').replace(/[<>=!~;@ ].*$/, '').replace(/\s.*$/, '').trim();
+const pipLabel = (pkg) => `Python: ${PKG_LABEL[pkg.toLowerCase()] || pkg}`;
+const importOf = (pkg) => PY_PKG_IMPORT[pkg.toLowerCase()] || pkg.toLowerCase().replace(/-/g, '_');
+
+// Arquivos regulares da skill (sem seguir links; limite de quantidade e tamanho).
+function skillFiles(dir) {
+  const out = [];
+  const walk = (d, depth) => {
+    if (depth > 6 || out.length >= INFER_MAX_FILES) return;
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (out.length >= INFER_MAX_FILES) return;
+      if (e.name === '.git' || e.name === 'node_modules' || e.name === '__pycache__' || e.name === '.venv') continue;
+      const f = path.join(d, e.name);
+      if (e.isDirectory()) walk(f, depth + 1);
+      else if (e.isFile()) out.push(f);
+    }
+  };
+  walk(dir, 0);
+  return out;
+}
+const readSmall = (f) => { try { const st = fs.lstatSync(f); return st.isFile() && st.size <= INFER_MAX_BYTES ? fs.readFileSync(f, 'utf8') : null; } catch { return null; } };
+
+// Blocos de código do SKILL.md (bash e afins), linha a linha, sem o prompt "$ ".
+function codeLines(md) {
+  const lines = [];
+  for (const m of md.matchAll(/\`\`\`([A-Za-z0-9_-]*)[^\n]*\n([\s\S]*?)\`\`\`/g)) {
+    if (m[1] && !/^(bash|sh|shell|zsh|console|terminal|cmd|powershell|ps1|text|)$/i.test(m[1])) continue;
+    for (const raw of m[2].split('\n')) {
+      const l = raw.replace(/^\s*(?:\$|>|PS>)\s+/, '').trim();
+      if (l && !l.startsWith('#')) lines.push(l);
+    }
   }
-  return [...seen.values()];
+  // comandos de instalação em código inline (`brew install x`)
+  const noBlocks = md.replace(/\`\`\`[\s\S]*?\`\`\`/g, '');
+  for (const m of noBlocks.matchAll(/\`([^\`\n]{4,160})\`/g)) if (SETUP_CMD_RE.test(m[1]) && /\binstall\b/.test(m[1])) lines.push(m[1].trim());
+  return lines;
 }
 
-async function checkDeps(folders) {
-  const deps = depsFor(folders);
-  const mac = process.platform === 'darwin';
-  const [npmRoot, hasPip, hasApt, hasBrew] = await Promise.all([
-    run('npm', ['root', '-g'], 10000).then((r) => r.stdout),
+// Dependências e passos deduzidos dos arquivos de uma skill. Cada item traz a evidência (de onde veio).
+function inferDeps(dir, folder) {
+  const deps = new Map(), steps = [], envVars = new Set();
+  const rel = (f) => path.relative(dir, f).split(path.sep).join('/');
+  const add = (d, evidence) => {
+    const key = `${d.type}:${d.name}`;
+    const prev = deps.get(key);
+    if (prev) { if (evidence && !prev.evidence.includes(evidence)) prev.evidence.push(evidence); if (!d.optional) prev.optional = false; return prev; }
+    const item = { ...d, inferred: true, evidence: evidence ? [evidence] : [], optional: Boolean(d.optional) };
+    deps.set(key, item);
+    return item;
+  };
+  const addPip = (spec, evidence, optional = false) => {
+    const pkg = pipName(spec);
+    if (!pkg || !DEP_NAME_RE.test(pkg) || pkg.startsWith('-')) return;
+    const mod = importOf(pkg);
+    if (!PY_MOD_RE.test(mod)) return;
+    add({ type: 'py', name: mod, pip: pkg, label: pipLabel(pkg), why: 'usado pelos scripts da skill', optional }, evidence);
+  };
+  const addSysPkg = (pkg, pm, evidence) => {
+    if (!DEP_NAME_RE.test(pkg)) return;
+    if (pm === 'brew' && /^--/.test(pkg)) return;
+    const bin = PKG_BIN[pkg] !== undefined ? PKG_BIN[pkg] : pkg;
+    if (!bin) return;
+    const d = add({ type: 'bin', name: bin, label: pkg === bin ? pkg : `${pkg} (${bin})`, why: 'programa citado no SKILL.md' }, evidence);
+    if (pm === 'brew') d.brew = d.brew || pkg;
+    if (pm === 'apt') d.apt = d.apt || pkg;
+    if (pm === 'winget') d.winget = d.winget || pkg;
+  };
+  const files = skillFiles(dir);
+  const names = new Set(files.map((f) => path.basename(f).replace(/\.[^.]+$/, '')));
+  for (const f of files) { let d = path.dirname(rel(f)); while (d && d !== '.') { names.add(path.basename(d)); d = path.dirname(d); } }
+  const localModule = (m) => names.has(m) || /^(utils|helpers|common|config|scripts|lib|src|core|main|app)$/.test(m);
+
+  const md = readSmall(path.join(dir, 'SKILL.md')) || '';
+  // 1) manifestos
+  for (const f of files) {
+    const r = rel(f), base = path.basename(f);
+    if (/^requirements[^/]*\.txt$/.test(base) || base === 'requirements.in') {
+      for (const line of (readSmall(f) || '').split('\n')) {
+        const l = line.replace(/#.*$/, '').trim();
+        if (!l || l.startsWith('-')) continue;
+        addPip(l, r);
+      }
+    } else if (base === 'pyproject.toml') {
+      const t = readSmall(f) || '';
+      const m = t.match(/^\s*dependencies\s*=\s*\[([\s\S]*?)\]/m);
+      if (m) for (const q of m[1].matchAll(/["']([^"']+)["']/g)) addPip(q[1], r);
+    } else if (base === 'Pipfile') {
+      const t = readSmall(f) || '';
+      const sec = (t.match(/^\[packages\]\s*\n([\s\S]*?)(?=^\[|$(?![\s\S]))/m) || [])[1] || '';
+      for (const line of sec.split('\n')) { const k = line.split('=')[0].trim(); if (k) addPip(k, r); }
+    } else if (base === 'package.json' && !r.includes('/node_modules/')) {
+      let pkg = null;
+      try { pkg = JSON.parse(readSmall(f) || ''); } catch {}
+      const list = Object.keys({ ...(pkg && pkg.dependencies), ...(pkg && pkg.devDependencies) });
+      if (list.length) steps.push({ kind: 'cmd', title: `Pacotes Node dos scripts (${list.slice(0, 6).join(', ')}${list.length > 6 ? '…' : ''})`, detail: `rode npm install na pasta ${path.dirname(r) === '.' ? 'da skill' : `${folder}/${path.dirname(r)}`} depois de instalar`, cmd: 'npm install', evidence: r });
+    }
+  }
+  // 2) scripts: imports Python, requires Node e shebangs
+  const pyImports = new Map(), nodeReqs = new Map(), shebangs = new Set();
+  for (const f of files) {
+    if (!/\.(py|js|cjs|mjs|ts|sh|bash)$/.test(f)) continue;
+    const s = readSmall(f);
+    if (s == null) continue;
+    const r = rel(f);
+    const sb = s.match(/^#![^\n]*/);
+    if (sb) { const w = sb[0].replace(/^#!\s*\S*\/(?:env\s+(?:-S\s+)?)?/, '').split(/\s/)[0]; if (w) shebangs.add(w.replace(/\d+(\.\d+)*$/, (v) => (w.startsWith('python') ? '3' : ''))); }
+    if (/\.py$/.test(f)) {
+      for (const m of s.matchAll(/^[ \t]*(?:from[ \t]+([A-Za-z_][\w]*)[\w.]*[ \t]+import|import[ \t]+([A-Za-z_][\w]*))/gm)) {
+        const mod = m[1] || m[2];
+        if (PY_STDLIB.has(mod) || localModule(mod) || PY_IMPORT_PKG[mod] === '') continue;
+        if (!pyImports.has(mod)) pyImports.set(mod, r);
+      }
+    } else if (/\.(js|cjs|mjs|ts)$/.test(f)) {
+      for (const m of s.matchAll(/(?:require\(\s*|from\s+|import\s+)['"]([^'"./][^'"]*)['"]/g)) {
+        const mod = m[1].replace(/^node:/, '').split('/').slice(0, m[1].startsWith('@') ? 2 : 1).join('/');
+        if (require('module').builtinModules.includes(mod) || !DEP_NAME_RE.test(mod)) continue;
+        if (!nodeReqs.has(mod)) nodeReqs.set(mod, r);
+      }
+    }
+  }
+  for (const [mod, r] of pyImports) {
+    const pkg = PY_IMPORT_PKG[mod] || mod;
+    add({ type: 'py', name: mod, pip: pkg, label: pipLabel(pkg), why: 'importado pelos scripts da skill' }, `${r} importa ${mod}`);
+  }
+  // 3) comandos de instalação citados no SKILL.md
+  const consumed = new Set();
+  for (const line of codeLines(md)) {
+    let m;
+    if ((m = line.match(/^(?:sudo\s+)?(?:(?:python3?|py)\s+-m\s+pip|pip3?|uv\s+pip)\s+install\s+(.+)$/i))) {
+      const args = m[1].split(/\s+/).filter((a) => a && !a.startsWith('-') && a !== 'install' && !/^(\.|\/|~)/.test(a) && !/\.txt$/.test(a));
+      if (/-r\s+\S+/.test(m[1]) && !args.length) { consumed.add(line); continue; } // requirements.txt já foi lido
+      for (const a of args) addPip(a, `SKILL.md: ${line.slice(0, 80)}`);
+      if (args.length) consumed.add(line);
+    } else if ((m = line.match(/^(?:sudo\s+)?(?:npm|pnpm|yarn|bun)\s+(?:install|add|i)\s+(?:-g|--global)\s+(.+)$/i)) || (m = line.match(/^(?:sudo\s+)?(?:npm|pnpm|yarn|bun)\s+(?:install|add|i)\s+(.+?)\s+(?:-g|--global)\s*$/i))) {
+      for (const a of m[1].split(/\s+/).filter((a) => a && !a.startsWith('-'))) {
+        const name = a.replace(/@(latest|next|[\d^~][^\s]*)$/, '');
+        if (DEP_NAME_RE.test(name)) { add({ type: 'npm', name, npm: name, label: `Node: ${name}`, why: 'ferramenta de linha de comando pedida pelo SKILL.md' }, `SKILL.md: ${line.slice(0, 80)}`); consumed.add(line); }
+      }
+    } else if ((m = line.match(/^(?:sudo\s+)?brew\s+install\s+(.+)$/i))) {
+      for (const a of m[1].split(/\s+/).filter((a) => a && !a.startsWith('-'))) addSysPkg(a, 'brew', `SKILL.md: ${line.slice(0, 80)}`);
+      consumed.add(line);
+    } else if ((m = line.match(/^(?:sudo\s+)?apt(?:-get)?\s+install\s+(.+)$/i))) {
+      for (const a of m[1].split(/\s+/).filter((a) => a && !a.startsWith('-'))) addSysPkg(a, 'apt', `SKILL.md: ${line.slice(0, 80)}`);
+      consumed.add(line);
+    } else if ((m = line.match(/^winget\s+install\s+(?:.*--id\s+)?(\S+)/i))) {
+      addSysPkg(m[1], 'winget', `SKILL.md: ${line.slice(0, 80)}`);
+      consumed.add(line);
+    }
+  }
+  // 4) programas usados pelos shebangs
+  if (shebangs.has('python3') || shebangs.has('python') || pyImports.size) add({ type: 'bin', name: IS_WIN ? 'python' : 'python3', label: 'Python 3', why: 'os scripts da skill são em Python', manual: 'https://www.python.org/downloads/', apt: 'python3', brew: 'python', winget: 'Python.Python.3.13', pacman: 'python' }, 'scripts .py');
+  if (shebangs.has('node') || nodeReqs.size) add({ type: 'bin', name: 'node', label: 'Node.js', why: 'os scripts da skill são em Node', manual: 'https://nodejs.org', apt: 'nodejs', brew: 'node', winget: 'OpenJS.NodeJS.LTS', pacman: 'nodejs' }, 'scripts .js');
+  // 5) passos que o hub não faz sozinho: outros comandos de setup e variáveis de ambiente
+  const seenCmd = new Set();
+  for (const line of codeLines(md)) {
+    if (consumed.has(line) || seenCmd.has(line) || !SETUP_CMD_RE.test(line)) continue;
+    if (!/\b(install|add|sync|init|login|auth|setup)\b/i.test(line) || /\b(run|test|start|exec|build)\b/i.test(line.split(/\s+/)[1] || '')) continue;
+    seenCmd.add(line);
+    if (steps.length < 8) steps.push({ kind: 'cmd', title: 'Comando pedido pelo SKILL.md', detail: '', cmd: line.slice(0, 160), evidence: 'SKILL.md' });
+  }
+  for (const m of md.matchAll(ENV_VAR_RE)) if (!/^(YOUR|MY|EXAMPLE|SOME|XXX|FOO)_/.test(m[1])) envVars.add(m[1]);
+  for (const v of [...envVars].slice(0, 6)) steps.push({ kind: 'env', title: `Variável de ambiente ${v}`, detail: 'o SKILL.md faz referência a ela: defina no ambiente da conta antes de usar', cmd: '', evidence: 'SKILL.md' });
+  if (nodeReqs.size && !files.some((f) => path.basename(f) === 'package.json')) {
+    const list = [...nodeReqs.keys()];
+    steps.push({ kind: 'cmd', title: `Pacotes Node usados pelos scripts (${list.slice(0, 6).join(', ')}${list.length > 6 ? '…' : ''})`, detail: 'não há package.json na skill: instale-os na pasta da skill se os scripts falharem', cmd: `npm install ${list.slice(0, 8).join(' ')}`, evidence: [...nodeReqs.values()][0] });
+  }
+  for (const d of deps.values()) { d.why = d.evidence.length ? `${d.why} · ${d.evidence.slice(0, 2).join('; ')}` : d.why; d.evidence = d.evidence.slice(0, 4); }
+  return { deps: [...deps.values()], steps, envVars: [...envVars] };
+}
+
+// Item do catálogo que contém a skill, se houver.
+function catalogItemOf(folder) {
+  const c = currentSynced(SYNCED.catalog).data || {};
+  for (const id of c.order || []) { const it = c.items && c.items[id]; if (it && Array.isArray(it.skills) && it.skills.includes(folder)) return it; }
+  return null;
+}
+const sameRepo = (a, b) => { try { return parseSource(a).label.toLowerCase() === parseSource(b).label.toLowerCase(); } catch { return false; } };
+
+// Onde está a pasta de cada skill: no clone (source) ou já instalada (installed).
+async function skillDirs(folders, opts) {
+  const out = new Map();
+  if (opts.source) {
+    const src = await fetchSource(opts.source);
+    for (const f of folders) { const sk = src.skills.find((x) => x.folder === f); if (sk) out.set(f, { dir: sk.dir, label: src.label, compatibility: sk.compatibility || '' }); }
+  } else if (opts.installed) {
+    for (const t of skillTargets()) for (const sk of t.skills) {
+      if (!folders.includes(sk.folder) || out.has(sk.folder)) continue;
+      let dir = path.join(t.dir, sk.folder);
+      try { dir = fs.realpathSync(dir); } catch {}
+      out.set(sk.folder, { dir, label: sk.source || '', compatibility: sk.compatibility || '' });
+    }
+  }
+  return out;
+}
+
+// Dependências das skills pedidas. Curadoria (skill-deps.json) só vale quando a skill é a do catálogo (mesmo repositório);
+// para qualquer outro repositório, o hub deduz pelos arquivos da própria skill.
+async function depsFor(folders, opts = {}) {
+  const seen = new Map();
+  const all = currentDeps();
+  const dirs = await skillDirs(folders, opts);
+  const steps = [], compat = {}, origin = {};
+  for (const f of folders) {
+    const where = dirs.get(f);
+    const cat = catalogItemOf(f);
+    const curated = cat && (!where || !where.label || sameRepo(cat.source, where.label));
+    let list = [];
+    if (curated) { list = Array.isArray(all[f]) ? all[f] : []; origin[f] = 'catalogo'; }
+    else if (where) {
+      const inf = inferDeps(where.dir, f);
+      list = inf.deps; origin[f] = 'inferida';
+      for (const s of inf.steps) steps.push({ ...s, skill: f });
+    } else origin[f] = 'desconhecida';
+    if (where && where.compatibility) compat[f] = where.compatibility;
+    for (const d of list) {
+      const key = `${d.type}:${d.name}`;
+      const prev = seen.get(key);
+      if (prev) { prev.skills.push(f); if (!d.optional) prev.optional = false; continue; }
+      seen.set(key, { ...d, key, skills: [f], optional: Boolean(d.optional) });
+    }
+  }
+  return { deps: [...seen.values()], steps, compat, origin };
+}
+
+// Gerenciadores de pacotes do sistema (Linux): o primeiro encontrado vale. "key" é a chave do pacote em skill-deps.json;
+// "py" dá o nome provável do pacote de um módulo Python quando o JSON não traz um explícito.
+const SYS_PMS = [
+  { id: 'apt', bin: 'apt-get', key: 'apt', args: (p) => ['apt', 'install', '-y', ...p], pipPkg: 'python3-pip', py: (pip) => `python3-${pip.toLowerCase()}`, fallbackKey: 'apt' },
+  { id: 'dnf', bin: 'dnf', key: 'dnf', args: (p) => ['dnf', 'install', '-y', ...p], pipPkg: 'python3-pip', py: (pip) => `python3-${pip.toLowerCase()}`, fallbackKey: 'apt' },
+  { id: 'zypper', bin: 'zypper', key: 'zypper', args: (p) => ['zypper', '--non-interactive', 'install', ...p], pipPkg: 'python3-pip', py: (pip) => `python3-${pip}`, fallbackKey: 'apt' },
+  { id: 'pacman', bin: 'pacman', key: 'pacman', args: (p) => ['pacman', '-S', '--needed', '--noconfirm', ...p], pipPkg: 'python-pip', py: (pip) => `python-${pip.toLowerCase()}`, fallbackKey: '' },
+  { id: 'apk', bin: 'apk', key: 'apk', args: (p) => ['apk', 'add', ...p], pipPkg: 'py3-pip', py: (pip) => `py3-${pip.toLowerCase()}`, fallbackKey: '' },
+];
+async function systemPm() {
+  if (IS_MAC || IS_WIN) return null;
+  for (const pm of SYS_PMS) if (await which(pm.bin)) return pm;
+  return null;
+}
+const sysPkgOf = (d, pm) => (d[pm.key] || (pm.fallbackKey && d.type === 'bin' ? d[pm.fallbackKey] : '') || (d.type === 'py' && d.apt && d.pip ? pm.py(d.pip) : '') || '');
+const MANUAL_URL = { node: 'https://nodejs.org', pip: 'https://pip.pypa.io/en/stable/installation/', brew: 'https://brew.sh' };
+
+// how de cada dependência que falta:
+//   pip | npm | brew  → o hub instala sozinho, sem sudo
+//   sys               → gerenciador do sistema (apt, dnf, zypper, pacman, apk): precisa de sudo, sai em sysCommand
+//   needs-pip         → módulo Python sem pip na máquina: o pip entra em sysCommand e a skill deve ser instalada de novo depois
+//   npm-sudo          → pacote Node com npm global do root: sai em npmCommand
+//   winget            → programa no Windows: sai em sysCommand (sem sudo, pode abrir o UAC)
+//   manual            → só à parte, com link em manual[]
+async function checkDeps(folders, opts = {}) {
+  const { deps, steps, compat, origin } = await depsFor(folders, opts);
+  const [npmRoot, hasPip, pm, hasBrew, hasWinget, hasNpm] = await Promise.all([
+    run('npm', ['root', '-g'], 10000).then((r) => (r.ok ? r.stdout : '')),
     pyRun(['-m', 'pip', '--version'], 10000).then((r) => r.ok),
-    mac || IS_WIN ? false : which('apt-get'),
-    mac ? which('brew') : false,
+    systemPm(),
+    IS_MAC ? which('brew') : false,
+    IS_WIN ? which('winget') : false,
+    which('npm'),
   ]);
+  const npmSudo = hasNpm && (await npmNeedsSudo());
   await Promise.all(deps.map(async (d) => {
-    if (!DEP_NAME_RE.test(d.name)) { d.ok = false; return; }
+    if (!DEP_NAME_RE.test(d.name) || (d.type === 'py' && !PY_MOD_RE.test(d.name))) { d.ok = false; d.how = 'manual'; return; }
     if (d.type === 'bin') d.ok = await which(d.name);
     else if (d.type === 'py') d.ok = (await pyRun(['-c', `import ${d.name}`])).ok;
     else if (d.type === 'npm') d.ok = Boolean(npmRoot) && fs.existsSync(path.join(npmRoot, d.name, 'package.json'));
+    if (d.ok) { d.how = ''; return; }
+    const sysPkg = pm ? sysPkgOf(d, pm) : '';
     if (d.type === 'py') {
-      d.how = hasPip ? 'pip' : hasApt ? (d.apt ? 'apt' : 'needs-pip') : 'manual';
-      if (d.how === 'manual') d.manual = d.manual || 'https://pip.pypa.io/en/stable/installation/';
-    } else if (d.type === 'npm') d.how = 'npm';
-    else if (mac) {
+      if (hasPip) d.how = 'pip';
+      else if (pm) { d.how = sysPkg ? 'sys' : 'needs-pip'; d.pkg = sysPkg; }
+      else if (IS_WIN && hasWinget) { d.how = 'winget'; d.pkg = 'Python.Python.3.13'; d.note = 'instala o Python com pip; depois instale a skill de novo'; }
+      else { d.how = 'manual'; d.manual = d.manual || MANUAL_URL.pip; }
+    } else if (d.type === 'npm') {
+      if (!hasNpm) { d.how = 'manual'; d.manual = MANUAL_URL.node; }
+      else d.how = npmSudo ? 'npm-sudo' : 'npm';
+    } else if (IS_MAC) {
       d.how = d.brew && hasBrew ? 'brew' : 'manual';
-      if (d.how === 'manual' && d.brew) d.manual = 'https://brew.sh';
-    } else d.how = d.apt && hasApt ? 'apt' : 'manual';
+      if (d.how === 'manual') d.manual = d.manual || (d.brew ? MANUAL_URL.brew : '');
+    } else if (IS_WIN) {
+      if (d.winget && hasWinget) { d.how = 'winget'; d.pkg = d.winget; } else d.how = 'manual';
+    } else if (pm && sysPkg) { d.how = 'sys'; d.pkg = sysPkg; }
+    else d.how = 'manual';
   }));
-  const missing = deps.filter((d) => !d.ok);
-  const need = missing.filter((d) => !d.optional);
-  const apt = [...new Set(need.filter((d) => d.how === 'apt').map((d) => d.apt))];
-  if (need.some((d) => d.how === 'needs-pip')) apt.push('python3-pip');
+  const need = deps.filter((d) => !d.ok && !d.optional);
+  const sysPkgs = [...new Set(need.filter((d) => d.how === 'sys' || d.how === 'winget').map((d) => d.pkg))];
+  if (pm && need.some((d) => d.how === 'needs-pip')) sysPkgs.push(pm.pipPkg);
+  const sysArgs = !sysPkgs.length ? [] : pm ? pm.args(sysPkgs) : IS_WIN ? ['winget', 'install', '-e', ...sysPkgs.flatMap((id) => ['--id', id])] : [];
+  const sysSudo = Boolean(pm) && sysArgs.length > 0;
+  const npmPkgs = [...new Set(need.filter((d) => d.how === 'npm-sudo').map((d) => d.npm))].filter((x) => DEP_NAME_RE.test(x));
+  const npmArgs = npmPkgs.length ? ['npm', 'install', '-g', ...npmPkgs] : [];
+  const sysCommand = sysArgs.length ? `${sysSudo ? 'sudo ' : ''}${sysArgs.join(' ')}` : '';
   return {
     deps,
+    steps, compat, origin,
+    inferred: deps.some((d) => d.inferred),
     allOk: need.length === 0,
     auto: need.filter((d) => ['pip', 'npm', 'brew'].includes(d.how)).map((d) => d.label),
-    aptCommand: apt.length ? `sudo apt install -y ${apt.join(' ')}` : '',
-    manual: need.filter((d) => d.how === 'manual').map((d) => ({ label: d.label, url: d.manual || '', pkg: d.apt || '' })),
+    sysCommand, sysArgs, sysSudo, sysPm: pm ? pm.id : IS_WIN && hasWinget ? 'winget' : '',
+    npmCommand: npmArgs.length ? `sudo ${npmArgs.join(' ')}` : '', npmArgs,
+    aptCommand: sysCommand, // nome antigo, mantido para quem já consumia a API
+    manual: need.filter((d) => d.how === 'manual').map((d) => ({ label: d.label, url: d.manual || '', pkg: d.apt || d.brew || '' })),
     hasPip,
   };
 }
 
-async function installDeps(folders, includeOptional = false) {
-  const before = await checkDeps(folders);
+async function installDeps(folders, includeOptional = false, opts = {}) {
+  const before = await checkDeps(folders, opts);
   const want = before.deps.filter((d) => !d.ok && (includeOptional || !d.optional));
   const pip = before.hasPip ? [...new Set(want.filter((d) => d.how === 'pip').map((d) => d.pip))].filter((x) => DEP_NAME_RE.test(x)) : [];
   const npm = [...new Set(want.filter((d) => d.how === 'npm').map((d) => d.npm))].filter((x) => DEP_NAME_RE.test(x));
@@ -736,9 +1148,10 @@ async function installDeps(folders, includeOptional = false) {
   }
   if (npm.length) {
     const r = await run('npm', ['install', '-g', '--silent', ...npm], 10 * 60 * 1000);
-    log.push(r.ok ? `Node: ${npm.join(', ')} instalados` : `Node: falhou (${r.stderr.split('\n').filter(Boolean).pop() || 'npm indisponível'})`);
+    const last = r.stderr.split('\n').filter(Boolean).pop() || 'npm indisponível';
+    log.push(r.ok ? `Node: ${npm.join(', ')} instalados` : `Node: falhou (${/EACCES|EPERM/.test(r.stderr) ? `sem permissão no npm global: rode no terminal sudo npm install -g ${npm.join(' ')}` : last})`);
   }
-  return { log, ...(await checkDeps(folders)) };
+  return { log, ...(await checkDeps(folders, opts)) };
 }
 
 function dirEqual(a, b) {
@@ -892,8 +1305,6 @@ async function installSkills(body) {
   const wanted = new Set(asList(body.skills).map(String));
   const targets = skillTargets().filter((t) => asList(body.targets).includes(t.dir));
   if (!targets.length) throw new Error('escolha pelo menos um agente');
-  const wantedOk = src.skills.filter((sk) => wanted.has(sk.folder));
-  for (const sk of wantedOk) if (!SKILL_NAME_RE.test(sk.folder)) throw new Error(`nome de skill inválido: ${sk.folder}`);
   const chosen = src.skills.filter((sk) => wanted.has(sk.folder));
   if (!chosen.length) throw new Error('escolha pelo menos uma skill');
   for (const sk of chosen) {
@@ -941,16 +1352,26 @@ async function installAccount(name, verb = 'instalar') {
   const account = readAccounts().find((a) => a.name === name);
   if (!account) throw new Error('conta não encontrada');
   if (verb === 'atualizar' && SELF_UPDATING[account.command]) throw new Error(SELF_UPDATING[account.command]);
-  const cmd = installCmd(account);
-  if (!cmd) throw new Error(`não há comando de instalação para "${account.command}"`);
+  const how = await resolveInstall(account);
+  if (!how.cmd) throw new Error(how.note || `não há comando de instalação para "${account.command}"`);
+  // a interface não tem como pedir a senha do sudo: a pessoa roda no terminal
+  if (how.needsSudo) throw new Error(`${how.note}. Rode no terminal: ${how.cmd}`);
   const min = NODE_MIN[account.command];
-  if (min && Number(process.versions.node.split('.')[0]) < min) {
+  if (min && (PKG_METHODS.includes(how.method) || how.method === 'config') && Number(process.versions.node.split('.')[0]) < min) {
     throw new Error(`${account.command} precisa do Node.js ${min} ou mais novo (você está no v${process.versions.node}). ` +
       `Com nvm: nvm install ${min} && nvm alias default ${min}, depois abra o hub de novo.`);
   }
-  const r = await runShell(cmd, 10 * 60 * 1000);
+  const r = await runShell(how.cmd, 10 * 60 * 1000);
+  if (r.ok) {
+    if (!(await which(account.command))) {
+      const dir = how.method === 'native' ? homeRel(path.join(HOME, '.local', 'bin')) : how.method === 'npm' ? homeRel(npmBinDir((await npmPrefix()) || '')) : '';
+      throw new Error(`${account.command} foi ${verb === 'atualizar' ? 'atualizado' : 'instalado'} via ${how.label}, mas não está no PATH${dir ? ` (procure em ${dir})` : ''}: abra um terminal novo ou adicione a pasta ao PATH e abra o hub de novo.`);
+    }
+    return how;
+  }
   const output = (r.stdout + '\n' + r.stderr).trim().split('\n').slice(-8).join('\n');
-  if (!r.ok) throw new Error(`falha ao ${verb} ${account.command}: ${output}`);
+  const hint = /EACCES|EPERM|permission denied|Permission denied/.test(output) ? ` Sem permissão de escrita: rode no terminal com sudo (${how.cmd}) ${NPM_PREFIX_HINT}.` : '';
+  throw new Error(`falha ao ${verb} ${account.command} via ${how.label} (${how.cmd}): ${output}${hint}`);
 }
 
 async function versions(installedMap) {
@@ -2196,9 +2617,19 @@ function unmaskEnv(list) {
 }
 
 async function state() {
-  const accounts = readAccounts().map((a) => ({ ...a, installCmd: installCmd(a) }));
-  const inst = await installed(accounts);
-  await Promise.all(accounts.map(async (a) => { a.login = inst[a.command] ? await loginStatus(a) : null; }));
+  const accounts = readAccounts();
+  const infos = await installInfos(accounts);
+  const inst = { aws: await which('aws') };
+  for (const [c, info] of Object.entries(infos)) inst[c] = Boolean(info);
+  await Promise.all(accounts.map(async (a) => {
+    const how = await resolveInstall(a, infos[a.command] || null);
+    a.installCmd = how.cmd;
+    a.installMethod = inst[a.command] ? how.label : '';
+    a.installPath = how.path ? homeRel(how.path) : '';
+    a.installNote = how.note;
+    a.installNeedsSudo = how.needsSudo;
+    a.login = inst[a.command] ? await loginStatus(a) : null;
+  }));
   return {
     apiVersion: API_VERSION,
     system: systemInfo(),
@@ -2389,12 +2820,12 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/api/skills/deps') {
       const body = await readBody(req);
-      return send(res, 200, await checkDeps((body.skills || []).map(String)));
+      return send(res, 200, await checkDeps((body.skills || []).map(String), { source: body.source ? String(body.source) : '', installed: Boolean(body.installed) }));
     }
     if (req.method === 'POST' && url.pathname === '/api/skills/deps/install') {
       const body = await readBody(req);
       if (TTY) event('wait', `instalando dependências de ${C.bold((body.skills || []).join(', '))}…`);
-      const r = await installDeps((body.skills || []).map(String), Boolean(body.optional));
+      const r = await installDeps((body.skills || []).map(String), Boolean(body.optional), { source: body.source ? String(body.source) : '', installed: Boolean(body.installed) });
       if (TTY) r.log.forEach((l) => event(/falhou/.test(l) ? 'bad' : 'ok', l));
       return send(res, 200, r);
     }
@@ -2403,7 +2834,7 @@ const server = http.createServer(async (req, res) => {
       if (TTY) event('wait', `buscando skills em ${C.bold(String(body.source))}…`);
       const src = await fetchSource(body.source, { fresh: true });
       if (TTY) event('ok', `${src.skills.length} skill(s) encontrada(s) em ${C.bold(src.label)}`);
-      const folders = (body.skills || []).map(String);
+      const folders = (body.skills || []).length ? (body.skills || []).map(String) : src.skills.map((x) => x.folder);
       const licenseOf = (dir) => {
         for (const d of [dir, src.dir]) for (const f of ['LICENSE', 'LICENSE.txt', 'LICENSE.md']) {
           const text = safeRead(path.join(d, f));
@@ -2421,7 +2852,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { source: src.label, commit: src.commit, date: src.date, checkedAt: new Date().toISOString(),
         license: firstSkill ? licenseOf(firstSkill.dir) : '',
         readme: folders.length ? readmeExcerpt(src, folders) : null,
-        skills: src.skills.map(({ name, description, folder, files }) => ({ name, description, folder, files })) });
+        skills: src.skills.map(({ name, description, folder, files, license, compatibility }) => ({ name, description, folder, files, license: license || '', compatibility: compatibility || '' })) });
     }
     if (req.method === 'POST' && url.pathname === '/api/skills/install') {
       const body = await readBody(req);
@@ -2565,11 +2996,13 @@ if (require.main !== module) {
   // usado pelo terminal: mesma lógica, sem abrir o servidor
   module.exports = {
     HOME, CONFIG, IS_WIN, IS_MAC, IS_WSL, systemInfo, systemDetails, repoInfo, TYPES, DEFAULT_INSTALL, SELF_UPDATING, NODE_MIN, installCmd,
+    INSTALL_WAYS, METHOD_LABEL, PKG_METHODS, wayCmd, classifyInstall, installInfo, installInfoFrom, installInfos, resolveInstall, npmNeedsSudo, npmPrefix, SYS_PMS, sysPkgOf,
     run, runShell, shellArgs, which, whichAll, python, pyRun, expandHome, homeRel, spawnArgs, winQuote, fullEnv, renameSafe, rmSafe,
     readAccounts, writeAccounts, validateAccounts, parseConfig, inferType,
     awsProfiles, iniSections, AWS_CONFIG, AWS_CREDENTIALS,
     loginStatus, codexLogin, geminiLogin, copilotLogin, claudeRelogin, detectAccounts,
-    skillTargets, skillMeta, fetchSource, parseSource, installSkills, checkDeps, installDeps, readSkillLock,
+    skillTargets, skillMeta, fetchSource, parseSource, installSkills, updateSkill, copySkill, removeSkill, checkDeps, installDeps, readSkillLock,
+    inferDeps, depsFor, catalogItemOf, codeLines,
     bedrockCheck, bedrockApply, toolInventory, versions, installed,
     instrTargets, instructionsState, saveInstruction, removeInstruction, scanGarbage, cleanGarbage,
     dropSources: () => { for (const entry of [...sourceCache.values(), ...retired]) dropSource(entry); sourceCache.clear(); retired.clear(); },

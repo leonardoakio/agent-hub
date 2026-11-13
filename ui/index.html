@@ -1050,7 +1050,7 @@
             <div class="field">
               <label for="f-install">Comando de instalação <span class="optional">(opcional)</span></label>
               <input class="input mono" type="text" id="f-install" spellcheck="false" placeholder="padrão para Claude, Codex, Gemini e Copilot">
-              <p class="hint">Roda no terminal como o seu usuário, para instalar e atualizar. Use só comandos de fonte confiável, ex.: <code>npm install -g pacote@latest</code>.</p>
+              <p class="hint">Deixe em branco para o hub usar o mesmo meio em que a CLI já está instalada (npm, Homebrew, instalador oficial, winget…). Roda no terminal como o seu usuário, para instalar e atualizar. Use só comandos de fonte confiável, ex.: <code>npm install -g pacote@latest</code>.</p>
             </div>
             <div class="field">
               <label for="f-env">Variáveis de ambiente extras <span class="optional">(uma por linha)</span></label>
@@ -1576,6 +1576,10 @@ function accountCard(a, i) {
   const chips = [];
   const dir = a.env.CLAUDE_CONFIG_DIR || a.env.CODEX_HOME || a.env.COPILOT_HOME || a.env.GEMINI_CLI_HOME;
   if (dir && a.type !== 'bedrock') chips.push(`<span class="chip mono" title="Pasta de login">${esc(dir)}</span>`);
+  // por onde a CLI foi instalada: é por esse meio que o hub atualiza
+  if (ok && a.installMethod) chips.push(`<span class="chip" title="${esc(a.installPath ? `Instalada em ${a.installPath}` : 'Meio de instalação')}${a.installCmd ? `&#10;Atualiza com: ${esc(a.installCmd)}` : ''}">via ${esc(a.installMethod)}</span>`);
+  const installNote = !job && a.installNote && (!ok || !SELF_UPDATING.includes(a.command))
+    ? `<p class="login-line" title="${esc(a.installNote)}">${icon('refresh')}<span>${esc(a.installNote)}</span></p>` : '';
 
   return `<article class="card" style="--c:${t.color}">
     ${watermark(t)}
@@ -1590,6 +1594,7 @@ function accountCard(a, i) {
       </div>
     </div>
     ${status}
+    ${installNote}
     ${chips.length ? `<div class="chips">${chips.join('')}</div>` : ''}
     <div class="cmd"><code>hub ${esc(a.name)}</code>
       <button class="btn ghost sm icon" data-action="copy" data-i="${i}" aria-label="Copiar comando hub ${esc(a.name)}" title="Copiar comando">${icon('copy')}</button></div>
@@ -1761,26 +1766,45 @@ function renderCatalog(installedSet) {
   }).join('');
 }
 
+// how que exigem o terminal (sudo ou UAC): saem como comando para copiar
+const NEEDS_TERMINAL = ['sys', 'apt', 'needs-pip', 'npm-sudo', 'winget'];
 const depLine = (d) => {
-  const how = d.ok ? '' : d.optional ? 'opcional' : (d.how === 'apt' || d.how === 'needs-pip') ? 'precisa de sudo' : d.how === 'manual' ? 'instale à parte' : 'o hub instala';
+  const how = d.ok ? '' : d.optional ? 'opcional' : d.how === 'winget' ? 'rode no terminal' : NEEDS_TERMINAL.includes(d.how) ? 'precisa de sudo' : d.how === 'manual' ? 'instale à parte' : 'o hub instala';
   return `<li class="dep ${d.ok ? 'ok' : d.optional ? 'opt' : 'miss'}"><span class="mark">${d.ok ? icon('check') : d.optional ? '○' : icon('x')}</span>
-    <span><b>${esc(d.label)}</b> <span class="none">(${esc(d.why || '')})</span>${how ? ` <span class="tag ${d.how === 'apt' || d.how === 'needs-pip' ? 'warn' : ''}">${how}</span>` : ''}</span></li>`;
+    <span><b>${esc(d.label)}</b> <span class="none">(${esc(d.why || '')})</span>${how ? ` <span class="tag ${NEEDS_TERMINAL.includes(d.how) ? 'warn' : ''}">${how}</span>` : ''}</span></li>`;
 };
+const cmdBox = (cmd) => `<div class="cmd"><code style="white-space:normal">${esc(cmd)}</code><button type="button" class="btn ghost sm icon" data-copy="${esc(cmd)}" aria-label="Copiar comando" title="Copiar">${icon('copy')}</button></div>`;
+// Passos que o SKILL.md pede e o hub não executa sozinho (comandos de setup, variáveis de ambiente).
+function stepsBlock(r) {
+  const steps = Array.isArray(r.steps) ? r.steps : [];
+  const compat = Object.entries(r.compat || {});
+  if (!steps.length && !compat.length) return '';
+  const many = new Set(steps.map((s) => s.skill)).size > 1;
+  return `${compat.map(([f, t]) => `<p class="hint" style="margin:0"><b>${compat.length > 1 ? `${esc(f)}: ` : ''}Compatibilidade declarada no SKILL.md:</b> ${esc(t)}</p>`).join('')}
+    ${steps.length ? `<div class="field"><span class="label">Depois de instalar <span class="none">· o SKILL.md pede; o hub não faz sozinho</span></span>
+      <ul class="deps">${steps.map((s) => `<li class="dep opt"><span class="mark">·</span><span><b>${many && s.skill ? `${esc(s.skill)}: ` : ''}${esc(s.title)}</b>${s.detail ? ` <span class="none">(${esc(s.detail)})</span>` : ''}${s.cmd ? `<br><code>${esc(s.cmd)}</code>` : ''}</span></li>`).join('')}</ul></div>` : ''}`;
+}
 function depsBlock(r, { intro = true } = {}) {
-  if (!r.deps.length) return '<p class="hint">Não precisa de nenhum programa ou pacote extra.</p>';
+  const inferredOnly = Object.values(r.origin || {}).includes('inferida');
+  if (!r.deps.length) return `<p class="hint">${inferredOnly ? 'Nenhuma dependência encontrada nos arquivos da skill (manifestos, scripts e SKILL.md).' : 'Não precisa de nenhum programa ou pacote extra.'}</p>${stepsBlock(r)}`;
   const plan = [];
+  if (r.inferred) plan.push('<p class="hint" style="margin:0">Dependências deduzidas dos arquivos da própria skill: manifestos, imports dos scripts e comandos citados no SKILL.md. Confira a evidência ao lado de cada uma.</p>');
   if (r.allOk) plan.push(`<p class="ok-text" style="margin:0">${icon('check')} Tudo pronto na sua máquina.</p>`);
   else {
     if (r.auto.length) plan.push(`<p class="hint" style="margin:0">Antes da skill, o hub instala sozinho (sem sudo${r.deps.some((d) => !d.ok && d.how === 'brew') ? ', pelo Homebrew' : ''}): <b>${esc(r.auto.join(', '))}</b>.</p>`);
-    if (r.aptCommand) plan.push(`<div class="field"><span class="label">Programas do sistema. Rode no terminal (pede sua senha):</span>
-      <div class="cmd"><code style="white-space:normal">${esc(r.aptCommand)}</code><button type="button" class="btn ghost sm icon" data-copy="${esc(r.aptCommand)}" aria-label="Copiar comando" title="Copiar">${icon('copy')}</button></div>
-      <p class="hint">Ou use <code>/skills</code> no terminal do hub: ele instala isso com sudo para você.</p>
+    const sysCmd = r.sysCommand || r.aptCommand;
+    if (sysCmd) plan.push(`<div class="field"><span class="label">Programas do sistema. Rode no terminal${r.sysSudo === false ? '' : ' (pede sua senha)'}:</span>
+      ${cmdBox(sysCmd)}
+      <p class="hint">Ou use <code>/skills</code> no terminal do hub: ele roda isso para você.</p>
       ${r.deps.some((d) => !d.ok && !d.optional && d.how === 'needs-pip') ? `<p class="hint">Depois disso, instale a skill de novo: com o pip disponível, o hub instala sozinho ${esc(r.deps.filter((d) => !d.ok && d.how === 'needs-pip').map((d) => d.label).join(', '))}.</p>` : ''}</div>`);
+    if (r.npmCommand) plan.push(`<div class="field"><span class="label">Pacotes Node. O npm global desta máquina é do root, então rode no terminal (pede sua senha):</span>
+      ${cmdBox(r.npmCommand)}
+      <p class="hint">Ou mude o prefixo do npm para a sua pasta (<code>npm config set prefix ~/.npm-global</code>) e o hub passa a instalar sozinho.</p></div>`);
     r.manual.forEach((m) => plan.push(`<p class="hint" style="margin:0">Instale à parte: ${m.url
       ? `<a href="${esc(safeUrl(m.url))}" target="_blank" rel="noopener noreferrer">${esc(m.label)}</a>`
-      : `<b>${esc(m.label)}</b> pelo gerenciador de pacotes do seu sistema${m.pkg ? ` (no Debian/Ubuntu: <code>${esc(m.pkg)}</code>)` : ''}`}</p>`));
+      : `<b>${esc(m.label)}</b> pelo gerenciador de pacotes do seu sistema${m.pkg ? ` (pacote parecido com <code>${esc(m.pkg)}</code>)` : ''}`}</p>`));
   }
-  return `${intro ? '' : ''}<ul class="deps">${r.deps.map(depLine).join('')}</ul>${plan.join('')}`;
+  return `${intro ? '' : ''}<ul class="deps">${r.deps.map(depLine).join('')}</ul>${plan.join('')}${stepsBlock(r)}`;
 }
 const aboutBlock = (short, full) => {
   const more = full && full.replace(/\s+/g, ' ').trim() !== short.replace(/\s+/g, ' ').trim();
@@ -1879,7 +1903,7 @@ async function openInstalledInfo(folder) {
   $('#dlg-sinfo').showModal();
   await Promise.all([
     source ? api('POST', '/api/skills/preview', { source, skills: [folder] }).then((r) => { live = r; }, (err) => { live = { error: err.message }; }) : Promise.resolve(),
-    api('POST', '/api/skills/deps', { skills: [folder] }).then((r) => { deps = r; }, (err) => { deps = { error: err.message }; }),
+    api('POST', '/api/skills/deps', { skills: [folder], installed: true }).then((r) => { deps = r; }, (err) => { deps = { error: err.message }; }),
   ].map((p) => p.then(() => tok === sinfoSeq && $('#dlg-sinfo').open && render(live, deps))));
 }
 
@@ -1950,7 +1974,7 @@ async function refreshSkillDeps() {
   if (!skills.length) { box.innerHTML = ''; skillDeps = null; return; }
   box.innerHTML = '<p class="hint"><span class="spin"></span> conferindo dependências na sua máquina…</p>';
   try {
-    const r = await api('POST', '/api/skills/deps', { skills });
+    const r = await api('POST', '/api/skills/deps', { skills, source: skillPreview?.source || '' });
     if (tok !== depsSeq) return;
     skillDeps = r;
     box.innerHTML = `<span class="label">Dependências na sua máquina</span>${depsBlock(skillDeps)}`;
@@ -1976,7 +2000,8 @@ async function findSkills() {
       <div class="field"><span class="label">${skillOnly ? 'Skill' + (shown.length > 1 ? 's' : '') : 'Skills encontradas'} em ${esc(skillPreview.source)}</span>
         <div class="check-list">${shown.map((sk) => `<label class="check">
           <input type="checkbox" name="sk-skill" value="${esc(sk.folder)}" checked>
-          <span><strong class="mono">${esc(sk.folder)}</strong> <span class="none">· ${plural(sk.files, 'arquivo')}</span>${sk.description ? `<br><span class="sub">${esc(sk.description.slice(0, 180))}${sk.description.length > 180 ? '…' : ''}</span>` : ''}</span></label>`).join('')}</div>
+          <span><strong class="mono">${esc(sk.folder)}</strong> <span class="none">· ${plural(sk.files, 'arquivo')}${sk.license ? ` · ${esc(sk.license)}` : ''}</span>${sk.description ? `<br><span class="sub">${esc(sk.description.slice(0, 180))}${sk.description.length > 180 ? '…' : ''}</span>` : ''}${sk.compatibility ? `<br><span class="sub"><b>Compatibilidade:</b> ${esc(sk.compatibility.slice(0, 200))}</span>` : ''}</span></label>`).join('')}</div>
+        ${skillPreview.license || skillPreview.readme ? `<p class="hint" style="margin:6px 0 0">${skillPreview.license ? `Licença do repositório: <b>${esc(skillPreview.license)}</b>. ` : ''}${skillPreview.readme ? `<details class="adv more" style="display:inline"><summary style="display:inline">${icon('chev')}Ler o README (${esc(skillPreview.readme.from)})</summary><div class="inner"><pre class="readme">${esc(skillPreview.readme.text)}</pre></div></details>` : ''}</p>` : ''}
         ${skillOnly && all.length > shown.length ? `<p class="hint">Este repositório tem ${all.length} skills. <button type="button" class="linklike" id="sk-showall">Ver todas</button></p>` : ''}</div>
       <div class="field" id="sk-deps"></div>
       <div class="field"><span class="label">Instalar em</span>
@@ -2021,7 +2046,7 @@ async function runSkillInstall(skills, targets) {
   steps[0].state = 'run'; show();
   let deps;
   try {
-    deps = await api('POST', '/api/skills/deps', { skills });
+    deps = await api('POST', '/api/skills/deps', { skills, source: skillPreview?.source || '' });
   } catch (err) {
     steps[0].state = 'bad'; steps[0].detail = esc(err.message);
     show();
@@ -2035,7 +2060,7 @@ async function runSkillInstall(skills, targets) {
   if (missingAuto.length) {
     steps[1].state = 'run'; steps[1].detail = esc(missingAuto.map((d) => d.label).join(', ')); show();
     try {
-      deps = await api('POST', '/api/skills/deps/install', { skills });
+      deps = await api('POST', '/api/skills/deps/install', { skills, source: skillPreview?.source || '' });
       const failed = deps.log.filter((l) => /falhou/.test(l));
       steps[1].state = failed.length ? 'bad' : 'ok';
       steps[1].detail = esc(deps.log.join(' · ') || 'nada a fazer');
@@ -2504,7 +2529,7 @@ function renderReview({ account: a, newProfile }) {
 }
 
 async function saveAccounts(accounts, okMsg) {
-  state = await api('PUT', '/api/accounts', { accounts: accounts.map(({ installCmd, login, ...a }) => a) });
+  state = await api('PUT', '/api/accounts', { accounts: accounts.map(({ installCmd, installMethod, installPath, installNote, installNeedsSudo, login, ...a }) => a) });
   toolsLoaded = false;
   render();
   toast(okMsg);
@@ -2524,7 +2549,8 @@ async function runJob(account, job) {
   try {
     state = await api('POST', job === 'update' ? '/api/update' : '/api/install', { name: account.name });
     const after = state.versions?.[account.command];
-    if (job === 'install') toast(`${account.command} instalado${after ? ` (v${after})` : ''}. No primeiro uso, faça login nele.`);
+    if (job === 'install' && !state.installed[account.command]) toast(`${account.command} instalado, mas ainda não aparece no PATH: abra um terminal novo e o hub de novo.`, 'bad');
+    else if (job === 'install') toast(`${account.command} instalado${after ? ` (v${after})` : ''}. No primeiro uso, faça login nele.`);
     else if (before && after && before === after) toast(`${account.command} já está na versão mais recente (v${after}).`);
     else toast(`${account.command} atualizado${before && after ? `: v${before} → v${after}` : ''}.`);
   } catch (err) {

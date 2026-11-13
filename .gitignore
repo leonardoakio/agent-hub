@@ -1,0 +1,14 @@
+node_modules/
+*.log
+
+# dados locais e de editor: nunca vão para o repositório
+.env
+.env.*
+/config
+*.bak
+*.tmp-*
+*.swp
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,22 @@
+#!/bin/sh
+# POSIX sh puro: roda no bash 3.2 do macOS, no dash e no WSL.
+
+self=$0
+# readlink -f não existe no macOS antes do 12.3
+while [ -L "$self" ]; do
+  dir=$(cd -P "$(dirname "$self")" && pwd)
+  target=$(readlink "$self")
+  case $target in
+    /*) self=$target ;;
+    *) self=$dir/$target ;;
+  esac
+done
+dir=$(cd -P "$(dirname "$self")" && pwd)
+
+if ! command -v node >/dev/null 2>&1; then
+  printf '%s\n' "✗ o hub precisa do Node.js 18 ou mais novo, e ele não foi encontrado." >&2
+  printf '%s\n' "  instale em https://nodejs.org (ou com nvm: nvm install --lts) e abra um terminal novo" >&2
+  exit 127
+fi
+
+exec node "$dir/hub.js" "$@"

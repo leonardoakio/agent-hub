@@ -1,0 +1,88 @@
+{
+  "_sobre": "Modelos (LLMs) por família e por onde usá-los, conferidos nas páginas oficiais. Skills não escolhem modelo: quem decide é o agente onde a skill roda. Atualize 'checkedAt' ao revisar.",
+  "checkedAt": "2026-11-13",
+  "agents": {
+    "claude": {
+      "title": "Claude Code",
+      "source": "https://code.claude.com/docs/en/model-config"
+    },
+    "codex": {
+      "title": "Codex",
+      "source": "https://learn.chatgpt.com/docs/models"
+    },
+    "gemini": {
+      "title": "Gemini CLI",
+      "source": "https://geminicli.com/docs/cli/model/"
+    },
+    "antigravity": {
+      "title": "Antigravity CLI",
+      "source": "https://antigravity.google/docs/models"
+    },
+    "copilot": {
+      "title": "Copilot CLI",
+      "source": "https://docs.github.com/en/copilot/reference/ai-models/supported-models"
+    }
+  },
+  "families": {
+    "claude": {
+      "title": "Claude",
+      "logo": "logo-claude",
+      "models": [
+        "Opus 5.5",
+        "Sonnet 5.5",
+        "Haiku 5.5",
+        "Fable 5.2"
+      ],
+      "via": [
+        "claude",
+        "copilot",
+        "antigravity"
+      ],
+      "extra": "No AWS Bedrock: Opus 5.5, Sonnet 4.5, Haiku 4.5 e Fable 5.2"
+    },
+    "gpt": {
+      "title": "GPT",
+      "logo": "logo-openai",
+      "models": [
+        "GPT-6 Astra",
+        "GPT-6.1 Sol",
+        "GPT-6.1 Terra",
+        "GPT-6 Luna"
+      ],
+      "via": [
+        "codex",
+        "copilot"
+      ],
+      "extra": "GPT-5.5 sai do Codex (login ChatGPT) em 14/10/2026"
+    },
+    "gemini": {
+      "title": "Gemini",
+      "logo": "logo-gemini",
+      "models": [
+        "Gemini 4 Carbon",
+        "Gemini 4 Argon",
+        "Gemini 4 Hydrogen",
+        "Gemini 3.8 Flash"
+      ],
+      "via": [
+        "antigravity",
+        "gemini",
+        "copilot"
+      ],
+      "extra": "No Gemini CLI só com chave de API ou Enterprise"
+    },
+    "outros": {
+      "title": "Outros",
+      "logo": "logo-copilot",
+      "models": [
+        "Grok 4.7",
+        "Kimi K3",
+        "MAI-Code-1.1-Flash"
+      ],
+      "via": [
+        "copilot"
+      ],
+      "extra": ""
+    }
+  }
+}

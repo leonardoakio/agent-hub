@@ -1,0 +1,274 @@
+{
+  "_sobre": "Catálogo de skills sugeridas (curadoria do hub). Vale sempre a versão que vem com o hub; versão, arquivos, licença e README de cada skill são lidos na hora do repositório oficial.",
+  "checkedAt": "2026-11-13",
+  "order": [
+    "security-audit",
+    "security-threat-model",
+    "mcp-builder",
+    "documentos",
+    "writing-guidelines",
+    "web-design-guidelines"
+  ],
+  "items": {
+    "security-audit": {
+      "title": "Auditoria de segurança",
+      "by": "Cloudflare",
+      "logo": "logo-cloudflare",
+      "tag": "Segurança",
+      "source": "cloudflare/security-audit-skill",
+      "skills": [
+        "security-audit"
+      ],
+      "desc": "Revisão de segurança completa: procura vulnerabilidades em código, APIs e serviços, com guias de referência e scripts de validação.",
+      "summary": "Transforma o agente em um auditor de segurança. A auditoria roda em 6 fases com agentes isolados: reconhecimento da arquitetura, caça guiada por cobertura, validação de cada suspeita por um verificador independente, saída estruturada, nova verificação e relatório final (REPORT.md, findings.json e um registro de cobertura). Rodadas seguintes no mesmo repositório complementam as anteriores. Foi a base do sistema de descoberta de vulnerabilidades da própria Cloudflare.",
+      "license": "MIT",
+      "requires": [
+        "Node.js, que roda os validadores (.cjs) incluídos"
+      ],
+      "agents": {
+        "claude": [
+          "ok",
+          "usa subagentes (ferramenta Task)"
+        ],
+        "codex": [
+          "ok",
+          "usa os subagentes do Codex"
+        ],
+        "gemini": [
+          "ok",
+          "usa os subagentes do Gemini CLI"
+        ],
+        "antigravity": [
+          "ok",
+          "o Antigravity lê skills no padrão SKILL.md (Agent Skills)"
+        ],
+        "copilot": [
+          "ok",
+          "usa os agentes delegados do Copilot CLI"
+        ]
+      },
+      "modelNote": "A própria skill se declara neutra: funciona com qualquer modelo, desde que o agente tenha subagentes (os quatro têm).",
+      "note": "Consome bastante token e leva tempo em repositórios grandes, porque usa vários agentes.",
+      "official": "https://github.com/cloudflare/security-audit-skill/tree/main/skills/security-audit",
+      "readme": "https://github.com/cloudflare/security-audit-skill#readme",
+      "complete": true
+    },
+    "security-threat-model": {
+      "title": "Modelo de ameaças",
+      "by": "OpenAI",
+      "logo": "logo-openai",
+      "tag": "Segurança",
+      "source": "openai/skills",
+      "skills": [
+        "security-threat-model"
+      ],
+      "desc": "Mapeia como o seu sistema pode ser atacado e o que proteger primeiro, com base no próprio código.",
+      "summary": "Cria um modelo de ameaças específico do repositório, não um checklist genérico: identifica componentes, fronteiras de confiança, ativos, pontos de entrada e o que um atacante realista consegue fazer. Lista os caminhos de abuso priorizados por probabilidade × impacto e recomenda mitigações ligadas a lugares concretos do código. Antes do relatório final, faz de 1 a 3 perguntas sobre o contexto (exposição na internet, autenticação, multi-tenant) e grava o resultado em <repo>-threat-model.md, com um diagrama Mermaid.",
+      "license": "Apache 2.0",
+      "requires": [],
+      "note": "Só entra em ação quando você pede um threat model. É interativa: pausa para confirmar o contexto antes de gerar o relatório.",
+      "modelNote": "Nenhuma dependência de modelo: só lê o código e escreve um relatório em Markdown.",
+      "agents": {
+        "claude": [
+          "ok"
+        ],
+        "codex": [
+          "ok"
+        ],
+        "gemini": [
+          "ok"
+        ],
+        "antigravity": [
+          "ok",
+          "o Antigravity lê skills no padrão SKILL.md (Agent Skills)"
+        ],
+        "copilot": [
+          "ok"
+        ],
+        "agents": [
+          "ok"
+        ]
+      },
+      "official": "https://github.com/openai/skills/tree/main/skills/.curated/security-threat-model",
+      "readme": "https://github.com/openai/skills#readme",
+      "complete": true
+    },
+    "mcp-builder": {
+      "title": "Criador de MCP",
+      "by": "Anthropic",
+      "logo": "logo-anthropic",
+      "tag": "Integrações",
+      "source": "anthropics/skills",
+      "skills": [
+        "mcp-builder"
+      ],
+      "desc": "Guia para criar servidores MCP que conectam o agente a outros serviços.",
+      "summary": "Guia para criar servidores MCP (Model Context Protocol) de qualidade, que deixam o agente usar serviços externos por meio de ferramentas bem desenhadas. Traz referências de boas práticas para Python (FastMCP) e Node/TypeScript (MCP SDK) e scripts para avaliar o servidor criado.",
+      "license": "Apache 2.0",
+      "requires": [
+        "Python ou Node.js no projeto do servidor",
+        "Scripts de avaliação: pacotes Python anthropic e mcp"
+      ],
+      "agents": {
+        "claude": [
+          "ok"
+        ],
+        "codex": [
+          "ok"
+        ],
+        "gemini": [
+          "ok"
+        ],
+        "antigravity": [
+          "ok",
+          "o Antigravity lê skills no padrão SKILL.md (Agent Skills)"
+        ],
+        "copilot": [
+          "ok"
+        ]
+      },
+      "modelNote": "Criar o servidor MCP funciona com qualquer modelo. Já os scripts de avaliação chamam a API da Anthropic (exigem ANTHROPIC_API_KEY) e usam por padrão o claude-3-7-sonnet-20250219, um modelo antigo. Passe -m com um modelo atual, ex.: -m claude-sonnet-5-5.",
+      "official": "https://github.com/anthropics/skills/tree/main/skills/mcp-builder",
+      "readme": "https://github.com/anthropics/skills#readme",
+      "complete": true
+    },
+    "documentos": {
+      "title": "Documentos",
+      "by": "Anthropic",
+      "logo": "logo-anthropic",
+      "tag": "Documentos",
+      "source": "anthropics/skills",
+      "skills": [
+        "pdf",
+        "docx",
+        "xlsx",
+        "pptx"
+      ],
+      "desc": "Ler, criar e editar PDF, Word, Excel e PowerPoint (4 skills).",
+      "summary": "São as skills que a Anthropic usa por baixo dos recursos de arquivos do Claude: ler, criar e editar PDF, Word, Excel e PowerPoint, com scripts de conversão e validação. A própria Anthropic avisa no README que são para demonstração e estudo. Teste antes de depender delas.",
+      "license": "Apache 2.0",
+      "requires": [
+        "Programas: LibreOffice, poppler-utils (pdftoppm), qpdf e pandoc",
+        "Python: pypdf, pdfplumber, pdf2image, Pillow, openpyxl, lxml, defusedxml",
+        "Node: docx e pptxgenjs (para criar arquivos)"
+      ],
+      "setup": "sudo apt install libreoffice poppler-utils qpdf pandoc\npip install pypdf pdfplumber pdf2image pillow openpyxl lxml defusedxml",
+      "agents": {
+        "claude": [
+          "ok"
+        ],
+        "codex": [
+          "ok"
+        ],
+        "gemini": [
+          "ok"
+        ],
+        "antigravity": [
+          "ok",
+          "o Antigravity lê skills no padrão SKILL.md (Agent Skills)"
+        ],
+        "copilot": [
+          "ok"
+        ]
+      },
+      "modelNote": "Nenhuma dependência de modelo: os scripts rodam localmente e qualquer modelo consegue chamá-los.",
+      "note": "O hub instala as skills completas, mas os programas acima precisam ser instalados à parte (pedem sudo).",
+      "official": "https://github.com/anthropics/skills/tree/main/skills",
+      "readme": "https://github.com/anthropics/skills#readme",
+      "complete": false
+    },
+    "writing-guidelines": {
+      "title": "Revisão de textos",
+      "by": "Vercel",
+      "logo": "logo-vercel",
+      "tag": "Documentação",
+      "source": "vercel-labs/agent-skills",
+      "skills": [
+        "writing-guidelines"
+      ],
+      "desc": "Revisa documentação e textos seguindo o guia de escrita da Vercel.",
+      "summary": "Revisa arquivos de documentação contra o Writing Guidelines da Vercel: voz e tom, palavras a evitar, concisão, sinais de texto gerado por IA, títulos, listas, blocos de código, links e pontuação. A cada revisão, baixa a versão mais recente das regras e devolve os problemas no formato arquivo:linha. Se você não indicar arquivos, ela pergunta quais revisar.",
+      "license": "MIT",
+      "requires": [
+        "Internet durante o uso: baixa as regras atualizadas a cada revisão"
+      ],
+      "note": "As regras foram escritas para textos em inglês. Em documentação em português, parte delas não se aplica.",
+      "modelNote": "O modelo não importa; o que importa é o agente conseguir acessar a internet.",
+      "agents": {
+        "claude": [
+          "ok",
+          "usa a ferramenta WebFetch, citada pela própria skill"
+        ],
+        "gemini": [
+          "ok",
+          "usa a ferramenta de busca na web do Gemini CLI"
+        ],
+        "antigravity": [
+          "warn",
+          "não confirmamos se o Antigravity CLI consegue baixar a página das regras"
+        ],
+        "codex": [
+          "warn",
+          "o sandbox padrão do Codex bloqueia a internet, então a skill não consegue baixar as regras"
+        ],
+        "copilot": [
+          "warn",
+          "não confirmamos se o Copilot CLI consegue baixar a página das regras"
+        ],
+        "agents": [
+          "warn",
+          "a pasta universal é lida por vários agentes; nem todos acessam a internet"
+        ]
+      },
+      "official": "https://github.com/vercel-labs/agent-skills/tree/main/skills/writing-guidelines",
+      "readme": "https://github.com/vercel-labs/agent-skills#readme",
+      "complete": true
+    },
+    "web-design-guidelines": {
+      "title": "Revisão de interface",
+      "by": "Vercel",
+      "logo": "logo-vercel",
+      "tag": "UX",
+      "source": "vercel-labs/agent-skills",
+      "skills": [
+        "web-design-guidelines"
+      ],
+      "desc": "Revisa a interface seguindo as Web Interface Guidelines (acessibilidade e UX).",
+      "summary": "Revisa o código da interface contra as Web Interface Guidelines da Vercel: mais de 100 regras de acessibilidade, performance e UX. A cada revisão, a skill busca a versão mais recente das regras na internet.",
+      "license": "MIT",
+      "requires": [
+        "Internet durante o uso (busca as regras atualizadas)"
+      ],
+      "agents": {
+        "claude": [
+          "ok",
+          "usa a ferramenta WebFetch, citada pela própria skill"
+        ],
+        "gemini": [
+          "ok",
+          "usa a ferramenta de busca na web do Gemini CLI"
+        ],
+        "antigravity": [
+          "warn",
+          "não confirmamos se o Antigravity CLI consegue baixar a página das regras"
+        ],
+        "codex": [
+          "warn",
+          "o sandbox padrão do Codex bloqueia a internet, então a skill não consegue baixar as regras"
+        ],
+        "copilot": [
+          "warn",
+          "não confirmamos se o Copilot CLI consegue baixar a página das regras"
+        ],
+        "agents": [
+          "warn",
+          "a pasta universal é lida por vários agentes; nem todos acessam a internet"
+        ]
+      },
+      "modelNote": "O modelo não importa; o que importa é o agente conseguir acessar a internet.",
+      "official": "https://github.com/vercel-labs/agent-skills/tree/main/skills/web-design-guidelines",
+      "readme": "https://github.com/vercel-labs/agent-skills#readme",
+      "complete": true
+    }
+  }
+}

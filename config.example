@@ -1,0 +1,33 @@
+# Configuração do hub — uma entrada por conta/ferramenta.
+# Fica em ~/.config/hub/config (não vai para o repositório).
+# Nenhuma credencial é salva aqui: só qual perfil/pasta de login cada CLI usa.
+#
+#   type    = claude | bedrock | codex | gemini | antigravity | copilot | custom (opcional; deduzido do command)
+#   label   = nome exibido no menu
+#   command = CLI que será aberta
+#   args    = argumentos fixos (opcional)
+#   env     = variáveis VAR=valor separadas por espaço (opcional)
+#   install = comando que instala/atualiza a CLI (opcional; claude, codex, gemini, copilot e agy já têm um)
+#             roda no bash (Linux/macOS/WSL) ou no cmd.exe (Windows)
+#
+# ~ vale como a pasta do seu usuário (no Windows, %USERPROFILE%), em command, args e env.
+
+[claude]
+label   = Claude
+command = claude
+# usa o login padrão em ~/.claude
+
+[claude-aws]
+label   = Claude via AWS
+command = claude
+# pasta separada para não misturar com a conta da assinatura
+# ajuste AWS_PROFILE e AWS_REGION para o perfil que tem acesso ao Bedrock
+env     = CLAUDE_CONFIG_DIR=~/.claude-aws CLAUDE_CODE_USE_BEDROCK=1 AWS_PROFILE=default AWS_REGION=us-east-1
+
+[codex]
+label   = Codex
+command = codex
+
+[gemini]
+label   = Gemini
+command = gemini

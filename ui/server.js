@@ -250,8 +250,28 @@ async function resolveInstall(a, info) {
 // Compatibilidade: comando "estático" (config ou padrão), sem olhar a máquina.
 const installCmd = (a) => a.install || DEFAULT_INSTALL[a.command] || '';
 
+// O Claude Code liga o Bedrock por CLAUDE_CODE_USE_BEDROCK vinda de qualquer lugar: do env da conta no hub,
+// do settings.json da pasta de login ou do próprio shell. O hub precisa enxergar as três fontes.
+const onFlag = (v) => v === '1' || String(v).toLowerCase() === 'true';
+function claudeSettingsEnv(a) {
+  const dir = a.env && a.env.CLAUDE_CONFIG_DIR ? expandHome(a.env.CLAUDE_CONFIG_DIR) : path.join(HOME, '.claude');
+  const env = readJson(path.join(dir, 'settings.json'))?.env;
+  return isObj(env) ? Object.fromEntries(Object.entries(env).filter(([, v]) => typeof v === 'string' || typeof v === 'number').map(([k, v]) => [k, String(v)])) : {};
+}
+// De onde vem o Bedrock desta conta: 'config' (env do hub), 'settings' (settings.json), 'shell' (ambiente) ou '' (não usa).
+function bedrockSource(a) {
+  if (a.command !== 'claude' && a.command !== 'claude.cmd' && !/[\\/]claude(\.exe|\.cmd)?$/i.test(String(a.command || ''))) return '';
+  if (a.env && a.env.CLAUDE_CODE_USE_BEDROCK != null) return onFlag(a.env.CLAUDE_CODE_USE_BEDROCK) ? 'config' : '';
+  const s = claudeSettingsEnv(a);
+  if (s.CLAUDE_CODE_USE_BEDROCK != null) return onFlag(s.CLAUDE_CODE_USE_BEDROCK) ? 'settings' : '';
+  return onFlag(process.env.CLAUDE_CODE_USE_BEDROCK) ? 'shell' : '';
+}
+// Variáveis AWS que valem para a conta, na mesma ordem de prioridade do Claude Code.
+const awsEnvOf = (a) => Object.fromEntries(Object.entries({ ...process.env, ...claudeSettingsEnv(a), ...a.env }).filter(([k]) => /^AWS_/.test(k)).map(([k, v]) => [k, expandHome(v)]));
+// Tipo real da conta: "claude" só é assinatura se nada liga o Bedrock.
+const effectiveType = (a) => (a.type === 'claude' && bedrockSource(a) ? 'bedrock' : a.type);
 function inferType(a) {
-  if (a.command === 'claude') return a.env.CLAUDE_CODE_USE_BEDROCK === '1' ? 'bedrock' : 'claude';
+  if (a.command === 'claude') return bedrockSource(a) ? 'bedrock' : 'claude';
   if (['codex', 'gemini', 'copilot'].includes(a.command)) return a.command;
   if (a.command === 'agy') return 'antigravity';
   return 'custom';
@@ -296,7 +316,11 @@ function parseConfig(text) {
       cur[key] = value;
     }
   }
-  for (const a of accounts) if (!TYPES.includes(a.type)) a.type = inferType(a);
+  for (const a of accounts) {
+    if (!TYPES.includes(a.type)) a.type = inferType(a);
+    a.type = effectiveType(a);
+    a.bedrockFrom = a.type === 'bedrock' ? bedrockSource(a) || 'config' : '';
+  }
   Object.defineProperty(accounts, 'header', { value: header });
   return accounts;
 }
@@ -1625,10 +1649,10 @@ function copilotLogin(a) {
 
 // Bedrock: a conta logada é a identidade da AWS (sts get-caller-identity não altera nada).
 async function bedrockLogin(a) {
-  const profile = a.env.AWS_PROFILE || 'default';
-  const region = a.env.AWS_REGION || a.env.AWS_DEFAULT_REGION || iniSections(AWS_CONFIG, true)[profile]?.region || '';
+  const env = awsEnvOf(a);
+  const profile = env.AWS_PROFILE || 'default';
+  const region = env.AWS_REGION || env.AWS_DEFAULT_REGION || iniSections(AWS_CONFIG, true)[profile]?.region || '';
   if (!(await which('aws'))) return { state: 'unknown', note: 'AWS CLI não instalado' };
-  const env = Object.fromEntries(Object.entries(a.env).filter(([k]) => /^AWS_/.test(k)).map(([k, v]) => [k, expandHome(v)]));
   const r = await run('aws', ['sts', 'get-caller-identity', '--profile', profile, '--output', 'json', ...(region ? ['--region', region] : [])], 15000, env);
   const aws = { profile, region };
   if (!r.ok) {
@@ -1657,7 +1681,11 @@ async function loginStatus(a, force = false) {
       let j = null;
       try { j = JSON.parse(r.stdout || ''); } catch {}
       if (!j || typeof j.loggedIn !== 'boolean') st = { state: 'unknown', note: 'não consegui consultar o login do Claude Code' };
-      else st = j.loggedIn ? { state: 'ok', who: j.email || '', plan: j.subscriptionType || '', relogin: claudeRelogin(dir) || j.loginExpiresAt || null } : { state: 'login', note: 'sessão encerrada' };
+      else if (j.loggedIn && j.apiProvider && !/^(firstparty|anthropic|claude\.ai)$/i.test(String(j.apiProvider))) {
+        // provedor de terceiros (Bedrock, Vertex, Foundry): não há login da Anthropic a vencer
+        const prov = { bedrock: 'Amazon Bedrock', vertex: 'Google Vertex AI', foundry: 'Microsoft Foundry' }[String(j.apiProvider).toLowerCase()] || String(j.apiProvider);
+        st = { state: 'ok', who: '', plan: '', note: `via ${prov}` };
+      } else st = j.loggedIn ? { state: 'ok', who: j.email || '', plan: j.subscriptionType || '', relogin: claudeRelogin(dir) || j.loginExpiresAt || null } : { state: 'login', note: 'sessão encerrada' };
     } else if (a.command === 'codex') {
       st = await codexLogin(a);
     } else if (a.command === 'gemini') {
@@ -2474,8 +2502,9 @@ const bedrockLabel = (p) => `${p.family[0].toUpperCase()}${p.family.slice(1)} ${
 function bedrockAccount(name) {
   const a = readAccounts().find((x) => x.name === name);
   if (!a || a.type !== 'bedrock') throw new Error('conta Bedrock não encontrada');
-  const profile = a.env.AWS_PROFILE || 'default';
-  const region = a.env.AWS_REGION || a.env.AWS_DEFAULT_REGION || iniSections(AWS_CONFIG, true)[profile]?.region || 'us-east-1';
+  const aws = awsEnvOf(a);
+  const profile = aws.AWS_PROFILE || 'default';
+  const region = aws.AWS_REGION || aws.AWS_DEFAULT_REGION || iniSections(AWS_CONFIG, true)[profile]?.region || 'us-east-1';
   const dir = a.env.CLAUDE_CONFIG_DIR ? expandHome(a.env.CLAUDE_CONFIG_DIR) : path.join(HOME, '.claude');
   return { a, profile, region, file: path.join(dir, 'settings.json') };
 }
@@ -2486,10 +2515,18 @@ function readSettings(file) {
   catch { throw new Error(`${homeRel(file)} não é um JSON válido. Corrija o arquivo antes (o hub não sobrescreve)`); }
 }
 
+// Configuração gerenciada pela organização: tem prioridade sobre o settings.json do usuário e o hub não a altera.
+// code.claude.com/docs/en/settings → caminhos por sistema operacional.
+const MANAGED_SETTINGS = IS_WIN ? path.join(process.env.ProgramData || 'C:\\ProgramData', 'ClaudeCode', 'managed-settings.json')
+  : IS_MAC ? '/Library/Application Support/ClaudeCode/managed-settings.json' : '/etc/claude-code/managed-settings.json';
+const managedEnv = () => { const e = readJson(MANAGED_SETTINGS)?.env; return isObj(e) ? e : {}; };
+
 async function bedrockCheck(name) {
   const { a, profile, region, file } = bedrockAccount(name);
   if (!(await which('aws'))) throw new Error('AWS CLI não instalado');
-  const env = Object.fromEntries(Object.entries(a.env).filter(([k]) => /^AWS_/.test(k)).map(([k, v]) => [k, expandHome(v)]));
+  const env = awsEnvOf(a);
+  // variáveis do Claude que valem para a conta: env do hub > settings.json > shell
+  const effective = { ...process.env, ...claudeSettingsEnv(a), ...a.env };
   const aws = (args) => run('aws', [...args, '--region', region, '--profile', profile, '--output', 'json'], 30000, env);
   const [prof, fm] = await Promise.all([
     aws(['bedrock', 'list-inference-profiles', '--type-equals', 'SYSTEM_DEFINED']),
@@ -2503,31 +2540,50 @@ async function bedrockCheck(name) {
   }
   const legacy = new Set();
   try { for (const m of JSON.parse(fm.stdout).modelSummaries || []) if (m.modelLifecycle?.status === 'LEGACY') legacy.add(m.modelId); } catch {}
-  const want = bedrockPrefix(region, a.env);
-  const best = {};
+  const want = bedrockPrefix(region, effective);
+  // perfis ativos por família, já sem os LEGACY
+  const avail = {};
   for (const p of JSON.parse(prof.stdout).inferenceProfileSummaries || []) {
     if (p.status && p.status !== 'ACTIVE') continue;
     const id = p.inferenceProfileId, parsed = parseBedrockId(id);
     if (!parsed || parsed.major < 4) continue;
     if (legacy.has(id.replace(/^[a-z-]+\.(?=anthropic\.)/, ''))) continue;
-    const rank = parsed.prefix === want ? 2 : parsed.prefix === 'global' ? 1 : 0;
-    const cur = best[parsed.family];
-    if (!cur || newer(parsed, cur.p) || (!newer(cur.p, parsed) && rank > cur.rank)) best[parsed.family] = { id, p: parsed, rank };
+    (avail[parsed.family] = avail[parsed.family] || []).push({ id, p: parsed });
   }
   const settings = readSettings(file);
-  const pinned = settings.env || {};
+  const pinned = isObj(settings.env) ? settings.env : {};
+  const managed = managedEnv();
+  // O que vale hoje para o Claude Code: gerenciado pela organização > settings.json da conta > shell.
+  const currentOf = (key) => (managed[key] != null ? [String(managed[key]), 'managed'] : pinned[key] != null ? [String(pinned[key]), 'settings'] : process.env[key] ? [process.env[key], 'shell'] : ['', '']);
+  // Versão mais nova da família; entre os perfis dessa versão, mantém o prefixo que a pessoa já usa (global., us., eu.…),
+  // senão o da região, senão global. Trocar global por regional muda roteamento e cota: só se não houver escolha.
+  const pick = (family, currentPrefix) => {
+    const list = avail[family] || [];
+    if (!list.length) return null;
+    let top = list[0];
+    for (const c of list) if (newer(c.p, top.p)) top = c;
+    const same = list.filter((c) => !newer(top.p, c.p) && !newer(c.p, top.p));
+    const rank = (c) => (currentPrefix && c.p.prefix === currentPrefix ? 3 : c.p.prefix === want ? 2 : c.p.prefix === 'global' ? 1 : 0);
+    return same.sort((x, y) => rank(y) - rank(x))[0];
+  };
+  const best = {};
   const rows = BEDROCK_FAMILIES.map((f) => {
-    const current = pinned[BEDROCK_KEY(f)] || '';
+    const [current, source] = currentOf(BEDROCK_KEY(f));
     const cp = parseBedrockId(current);
-    const latest = best[f];
-    const status = !latest ? 'missing' : !current ? 'new' : current === latest.id ? 'ok'
+    const latest = pick(f, cp ? cp.prefix : '');
+    best[f] = latest;
+    const status = !latest ? 'missing' : source === 'managed' ? 'managed' : !current ? 'new' : current === latest.id ? 'ok'
       : cp && newer(cp, latest.p) ? 'ahead' : current.startsWith('arn:') ? 'custom' : 'update';
-    return { family: f, key: BEDROCK_KEY(f), current, currentLabel: cp ? bedrockLabel(cp) : '', latest: latest?.id || '', latestLabel: latest ? bedrockLabel(latest.p) : '', status };
+    return { family: f, key: BEDROCK_KEY(f), current, currentLabel: cp ? bedrockLabel(cp) : '', source, latest: latest?.id || '', latestLabel: latest ? bedrockLabel(latest.p) : '', status };
   });
-  const mp = parseBedrockId(a.env.ANTHROPIC_MODEL);
+  const mainId = a.env.ANTHROPIC_MODEL || '';
+  const mp = parseBedrockId(mainId);
   const main = mp && best[mp.family] && newer(best[mp.family].p, mp)
-    ? { current: a.env.ANTHROPIC_MODEL, currentLabel: bedrockLabel(mp), latest: best[mp.family].id, latestLabel: bedrockLabel(best[mp.family].p) } : null;
-  return { name, profile, region, prefix: want, file: homeRel(file), rows, main, changes: rows.filter((r) => r.status === 'new' || r.status === 'update').length + (main ? 1 : 0) };
+    ? { current: mainId, currentLabel: bedrockLabel(mp), latest: best[mp.family].id, latestLabel: bedrockLabel(best[mp.family].p) } : null;
+  return {
+    name, profile, region, prefix: want, file: homeRel(file), managedFile: rows.some((r) => r.source === 'managed') ? MANAGED_SETTINGS : '',
+    rows, main, changes: rows.filter((r) => r.status === 'new' || r.status === 'update').length + (main ? 1 : 0),
+  };
 }
 
 async function bedrockApply(name, { includeMain = true } = {}) {
@@ -2552,6 +2608,200 @@ async function bedrockApply(name, { includeMain = true } = {}) {
     changed.push(`ANTHROPIC_MODEL (hub): ${check.main.current} → ${check.main.latest}`);
   }
   return { ...(await bedrockCheck(name)), applied: changed };
+}
+
+// ---- Modelos de cada ferramenta: o que está fixado na configuração local x o mais recente na fonte oficial ----
+// Claude (assinatura/API): página de modelos da Anthropic. Claude via Bedrock: a própria conta AWS (bedrockCheck).
+// Codex: models.json do repositório openai/codex. Gemini CLI: models.ts do repositório google-gemini/gemini-cli.
+// Copilot CLI: tabela de modelos do repositório github/docs (só aviso: o hub não grava o settings.json do Copilot).
+const MODEL_SOURCES = {
+  claude: { url: 'https://platform.claude.com/docs/en/about-claude/models/overview.md', label: 'documentação oficial da Anthropic' },
+  codex: { url: 'https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json', label: 'repositório oficial openai/codex' },
+  gemini: { url: 'https://raw.githubusercontent.com/google-gemini/gemini-cli/main/packages/core/src/config/models.ts', label: 'repositório oficial google-gemini/gemini-cli' },
+  copilot: { url: 'https://raw.githubusercontent.com/github/docs/main/data/tables/copilot/model-supported-clients.yml', label: 'documentação oficial do GitHub (github/docs)' },
+};
+const officialCache = new Map();
+async function fetchOfficial(tool) {
+  const src = MODEL_SOURCES[tool];
+  const hit = officialCache.get(tool);
+  if (hit && Date.now() - hit.at < 6 * 60 * 60 * 1000) return hit.text;
+  let text = '';
+  try {
+    const res = await fetch(src.url, { signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'agent-hub' } });
+    if (res.ok) text = await res.text();
+  } catch {}
+  // redes com proxy ou certificado próprio: o curl do sistema costuma já estar configurado
+  if (!text && (await which('curl'))) { const r = await run('curl', ['-fsSL', '--max-time', '20', src.url], 25000); if (r.ok) text = r.stdout; }
+  if (!text) throw new Error(`não consegui consultar a ${src.label} (sem rede?)`);
+  officialCache.set(tool, { at: Date.now(), text });
+  return text;
+}
+const modelNewer = (a, b) => (a[0] !== b[0] ? a[0] > b[0] : (a[1] || 0) > (b[1] || 0));
+const saveWithBak = (file, text) => { if (fs.existsSync(file)) fs.copyFileSync(file, file + '.bak'); writeReal(file, text); };
+const modelRow = (key, label, current, latest, status, note = '') => ({ key, label, current, latest, status, note });
+
+// Claude de assinatura ou chave de API: apelidos (opus, sonnet, fable…) acompanham o cliente; só ID completo fica velho.
+const CLAUDE_ID_RE = /^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?:-(\d{8}))?(\[[^\]]*\])?$/;
+async function claudeModels(a) {
+  const dir = a.env.CLAUDE_CONFIG_DIR ? expandHome(a.env.CLAUDE_CONFIG_DIR) : path.join(HOME, '.claude');
+  const file = path.join(dir, 'settings.json');
+  const settings = readSettings(file);
+  const env = isObj(settings.env) ? settings.env : {};
+  const managed = readJson(MANAGED_SETTINGS) || {};
+  const menv = isObj(managed.env) ? managed.env : {};
+  const slots = [['model', 'Modelo padrão', settings.model, managed.model, 'top'],
+    ['ANTHROPIC_MODEL', 'ANTHROPIC_MODEL', env.ANTHROPIC_MODEL, menv.ANTHROPIC_MODEL, 'env'],
+    ...BEDROCK_FAMILIES.map((f) => [BEDROCK_KEY(f), `Apelido ${f}`, env[BEDROCK_KEY(f)], menv[BEDROCK_KEY(f)], 'env'])];
+  const pinned = slots.filter(([, , v, m]) => CLAUDE_ID_RE.test(String(m != null ? m : v || '')));
+  let latest = {};
+  if (pinned.length) {
+    const text = await fetchOfficial('claude');
+    for (const m of text.matchAll(/\bclaude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?!\d)/g)) {
+      const v = [Number(m[2]), Number(m[3] || 0)];
+      if (!latest[m[1]] || modelNewer(v, latest[m[1]].v)) latest[m[1]] = { id: m[0], v };
+    }
+  }
+  const rows = [];
+  for (const [key, label, value, man, where] of slots) {
+    const cur = String(man != null ? man : value || '');
+    if (!cur) { if (key === 'model') rows.push(modelRow(key, label, '', '', 'auto', 'padrão do Claude Code: acompanha a versão do cliente')); continue; }
+    const m = cur.match(CLAUDE_ID_RE);
+    if (!m) { rows.push(modelRow(key, label, cur, '', 'auto', /^claude-/.test(cur) ? 'ID fora do padrão atual: o hub não altera' : `apelido "${cur}": acompanha o modelo mais recente da família`)); continue; }
+    const best = latest[m[1]];
+    const v = [Number(m[2]), Number(m[3] || 0)];
+    const next = best && modelNewer(best.v, v) ? best.id + (m[5] || '') : '';
+    const row = modelRow(key, label, cur, next || cur, man != null ? 'managed' : next ? 'update' : 'ok', man != null ? `fixado pela organização em ${MANAGED_SETTINGS}` : '');
+    row.where = where;
+    rows.push(row);
+  }
+  return { tool: 'claude', file, source: MODEL_SOURCES.claude.label, rows, apply: (todo) => {
+    const s = readSettings(file);
+    s.env = isObj(s.env) ? s.env : {};
+    for (const r of todo) { if (r.where === 'top') s.model = r.latest; else s.env[r.key] = r.latest; }
+    if (!Object.keys(s.env).length) delete s.env;
+    saveWithBak(file, JSON.stringify(s, null, 2) + '\n');
+  } };
+}
+
+// Codex: a linha model = "…" do topo do config.toml. O models.json oficial diz para qual modelo cada um migra.
+async function codexModels(a) {
+  const file = path.join(a.env.CODEX_HOME ? expandHome(a.env.CODEX_HOME) : path.join(HOME, '.codex'), 'config.toml');
+  const text = safeRead(file) || '';
+  const lines = text.split('\n');
+  let at = -1, cur = '';
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*\[/.test(lines[i])) break; // só o topo: perfis ([profiles.x]) são escolha de quem os criou
+    const m = lines[i].match(/^\s*model\s*=\s*(["'])([^"']+)\1/);
+    if (m) { at = i; cur = m[2]; break; }
+  }
+  if (!cur) return { tool: 'codex', file, source: MODEL_SOURCES.codex.label, rows: [modelRow('model', 'Modelo padrão', '', '', 'auto', 'sem modelo fixado: o Codex usa o padrão da versão instalada')], apply: () => {} };
+  let list = [];
+  try { list = JSON.parse(await fetchOfficial('codex')).models || []; } catch (e) { if (/não consegui/.test(e.message)) throw e; throw new Error('a lista oficial de modelos do Codex veio em formato inesperado'); }
+  const by = new Map(list.map((m) => [m.slug, m]));
+  let next = cur, known = by.has(cur);
+  for (let i = 0; i < 6 && by.get(next)?.upgrade?.model && by.get(next).upgrade.model !== next; i++) next = by.get(next).upgrade.model;
+  const row = !known ? modelRow('model', 'Modelo padrão', cur, '', 'unknown', 'não está na lista oficial do Codex: o hub não altera')
+    : modelRow('model', 'Modelo padrão', cur, next, next !== cur ? 'update' : 'ok', next !== cur ? `a OpenAI indica ${by.get(next)?.display_name || next} como sucessor` : '');
+  return { tool: 'codex', file, source: MODEL_SOURCES.codex.label, rows: [row], apply: (todo) => {
+    if (!todo.length || at < 0) return;
+    const fresh = (safeRead(file) || '').split('\n');
+    if (!new RegExp(`^\\s*model\\s*=\\s*(["'])${cur.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\1`).test(fresh[at] || '')) throw new Error('o config.toml do Codex mudou durante a atualização: tente de novo');
+    fresh[at] = fresh[at].replace(cur, todo[0].latest);
+    saveWithBak(file, fresh.join('\n'));
+  } };
+}
+
+// Gemini CLI: model.name no settings.json. Apelidos (auto, pro, flash…) acompanham o cliente.
+const GEMINI_ID_RE = /^gemini-(\d+)(?:\.(\d+))?-(pro|flash-lite|flash)(-.+)?$/;
+async function geminiModels(a) {
+  const file = path.join(geminiDir(a), 'settings.json');
+  const raw = safeRead(file);
+  let settings = null;
+  if (raw != null) { try { settings = JSON.parse(raw); } catch {} }
+  const src = MODEL_SOURCES.gemini.label;
+  if (raw != null && !settings) return { tool: 'gemini', file, source: src, rows: [modelRow('model.name', 'Modelo padrão', '', '', 'unknown', 'o settings.json tem comentários ou erro de sintaxe: o hub não altera')], apply: () => {} };
+  const cur = String((isObj(settings?.model) ? settings.model.name : typeof settings?.model === 'string' ? settings.model : '') || '');
+  if (!cur) return { tool: 'gemini', file, source: src, rows: [modelRow('model.name', 'Modelo padrão', '', '', 'auto', 'sem modelo fixado: o Gemini CLI escolhe sozinho (auto)')], apply: () => {} };
+  const m = cur.match(GEMINI_ID_RE);
+  if (!m) return { tool: 'gemini', file, source: src, rows: [modelRow('model.name', 'Modelo padrão', cur, '', 'auto', /^gemini-/.test(cur) ? 'ID fora do padrão: o hub não altera' : `apelido "${cur}": acompanha o modelo mais recente`)], apply: () => {} };
+  const text = await fetchOfficial('gemini');
+  let best = null;
+  for (const q of text.matchAll(/'(gemini-[0-9][a-z0-9.-]*)'/g)) {
+    const g = q[1].match(GEMINI_ID_RE);
+    if (!g || g[4] || g[3] !== m[3]) continue; // só versões estáveis da mesma linha (pro, flash, flash-lite)
+    const v = [Number(g[1]), Number(g[2] || 0)];
+    if (!best || modelNewer(v, best.v)) best = { id: q[1], v };
+  }
+  const v = [Number(m[1]), Number(m[2] || 0)];
+  const next = best && modelNewer(best.v, v) ? best.id : '';
+  const row = modelRow('model.name', 'Modelo padrão', cur, next || cur, next ? 'update' : best && modelNewer(v, best.v) ? 'ahead' : 'ok', next ? '' : m[4] ? 'versão de prévia: mantida' : '');
+  return { tool: 'gemini', file, source: src, rows: [row], apply: (todo) => {
+    if (!todo.length) return;
+    const s = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (isObj(s.model)) s.model.name = todo[0].latest; else s.model = { name: todo[0].latest };
+    saveWithBak(file, JSON.stringify(s, null, 2) + '\n');
+  } };
+}
+
+// Copilot CLI: o settings.json aceita comentários e os IDs não são publicados em formato de máquina,
+// então o hub só avisa quando há versão mais nova da mesma linha; a troca é pelo /model do próprio Copilot.
+async function copilotModels(a) {
+  const file = path.join(a.env.COPILOT_HOME ? expandHome(a.env.COPILOT_HOME) : path.join(HOME, '.copilot'), 'settings.json');
+  const raw = safeRead(file) || '';
+  const src = MODEL_SOURCES.copilot.label;
+  const cur = (raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').match(/"model"\s*:\s*"([^"]+)"/) || [])[1] || '';
+  if (!cur) return { tool: 'copilot', file, source: src, rows: [modelRow('model', 'Modelo padrão', '', '', 'auto', 'sem modelo fixado: o Copilot usa o padrão do seu plano')], apply: () => {} };
+  const slug = (s) => String(s).toLowerCase().replace(/\(.*?\)/g, '').trim().replace(/\s+/g, '-');
+  const shape = (s) => { const m = s.match(/^(.*?)(\d+(?:\.\d+)?)(.*)$/); return m ? { line: `${m[1]}#${m[3]}`, v: m[2].split('.').map(Number) } : null; };
+  const names = [];
+  let name = '';
+  for (const l of (await fetchOfficial('copilot')).split('\n')) {
+    const n = l.match(/^- name:\s*['"]?(.+?)['"]?\s*$/);
+    if (n) { name = n[1]; continue; }
+    if (name && /^\s+cli:\s*true\b/.test(l)) { names.push(name); name = ''; }
+  }
+  const mine = shape(slug(cur));
+  let best = null;
+  for (const n of names) {
+    if (/preview/i.test(n)) continue;
+    const s = shape(slug(n));
+    if (mine && s && s.line === mine.line && modelNewer(s.v, mine.v) && (!best || modelNewer(s.v, best.v))) best = { name: n, v: s.v };
+  }
+  const row = best ? modelRow('model', 'Modelo padrão', cur, best.name, 'advice', `há versão mais nova: ${best.name}. Troque com /model dentro do Copilot`)
+    : modelRow('model', 'Modelo padrão', cur, cur, mine ? 'ok' : 'unknown', mine ? '' : 'não reconhecido na lista oficial');
+  return { tool: 'copilot', file, source: src, rows: [row], apply: () => {} };
+}
+
+const MODEL_CHECKERS = { claude: claudeModels, codex: codexModels, gemini: geminiModels, copilot: copilotModels };
+async function modelsProbe(name) {
+  const a = readAccounts().find((x) => x.name === name);
+  if (!a) throw new Error('conta não encontrada');
+  if (a.type === 'bedrock') return { a, bedrock: true };
+  const fn = MODEL_CHECKERS[a.type];
+  if (!fn) return { a, none: true };
+  return { a, r: await fn(a) };
+}
+// Situação dos modelos de uma conta, no mesmo formato para todas as ferramentas.
+async function modelsCheck(name) {
+  const p = await modelsProbe(name);
+  if (p.none) return { name, tool: p.a.type, file: '', source: '', rows: [], changes: 0, note: 'esta ferramenta escolhe o modelo dentro dela: não há o que fixar' };
+  if (p.bedrock) {
+    const b = await bedrockCheck(name);
+    const rows = b.rows.map((x) => modelRow(x.key, x.family, x.current, x.latest, x.status, x.status === 'managed' ? `fixado pela organização em ${b.managedFile}` : ''));
+    if (b.main) rows.push(modelRow('ANTHROPIC_MODEL', 'principal (config do hub)', b.main.current, b.main.latest, 'update'));
+    return { name, tool: 'bedrock', file: b.file, source: `sua conta AWS (Bedrock em ${b.region})`, rows, changes: b.changes };
+  }
+  const { r } = p;
+  return { name, tool: r.tool, file: homeRel(r.file), source: r.source, rows: r.rows, changes: r.rows.filter((x) => x.status === 'update').length };
+}
+// Fixa os modelos mais recentes na configuração local da conta. Só mexe nas chaves de modelo; guarda uma cópia .bak.
+async function modelsApply(name) {
+  const p = await modelsProbe(name);
+  if (p.none) return { ...(await modelsCheck(name)), applied: [] };
+  if (p.bedrock) { const b = await bedrockApply(name); return { ...(await modelsCheck(name)), applied: b.applied }; }
+  const todo = p.r.rows.filter((x) => x.status === 'update');
+  if (todo.length) p.r.apply(todo);
+  return { ...(await modelsCheck(name)), applied: todo.map((x) => `${x.label}: ${x.current} → ${x.latest}`) };
 }
 
 const RESERVED_NAMES = ['ui', 'install', 'update', 'skills', 'skill', 'list', 'check', 'doctor', 'config', 'help'];
@@ -2581,7 +2831,18 @@ async function detectAccounts() {
   // Bedrock não guarda credenciais na pasta do Claude
   for (const d of entries.filter((e) => e === '.claude' || e.startsWith('.claude-'))) {
     // no macOS o login fica no Keychain: a pasta usada já indica a conta
-    if (['.credentials.json', 'history.jsonl', 'projects'].some((f) => fs.existsSync(path.join(HOME, d, f)))) add('claude', path.join(HOME, d), 'CLAUDE_CONFIG_DIR', d === '.claude');
+    if (!['.credentials.json', 'history.jsonl', 'projects', 'settings.json'].some((f) => fs.existsSync(path.join(HOME, d, f)))) continue;
+    const probe = { command: 'claude', env: d === '.claude' ? {} : { CLAUDE_CONFIG_DIR: path.join(HOME, d) } };
+    const from = bedrockSource(probe);
+    const before = found.length;
+    add('claude', path.join(HOME, d), 'CLAUDE_CONFIG_DIR', d === '.claude');
+    if (!from || found.length === before) continue; // pasta já cadastrada, ou Claude de assinatura
+    const f = found[found.length - 1];
+    const aws = awsEnvOf(probe);
+    f.type = 'bedrock';
+    f.label = f.label.replace(/^Claude/, 'Claude via AWS');
+    f.env = { ...f.env, CLAUDE_CODE_USE_BEDROCK: '1', ...(aws.AWS_PROFILE ? { AWS_PROFILE: aws.AWS_PROFILE } : {}), ...(aws.AWS_REGION ? { AWS_REGION: aws.AWS_REGION } : {}) };
+    f.bedrockFrom = from;
   }
   for (const d of entries.filter((e) => e === '.codex' || e.startsWith('.codex-'))) {
     if (fs.existsSync(path.join(HOME, d, 'auth.json'))) add('codex', path.join(HOME, d), 'CODEX_HOME', d === '.codex');
@@ -2816,7 +3077,21 @@ const server = http.createServer(async (req, res) => {
       if (TTY) event('wait', `atualizando a CLI de ${C.bold(String(body.name))}…`);
       try { await installAccount(String(body.name || ''), 'atualizar'); } catch (e) { if (TTY) event('bad', e.message.split('\n')[0]); throw e; }
       if (TTY) event('ok', `CLI de ${C.bold(String(body.name))} atualizada`);
-      return send(res, 200, await state());
+      // atualizar o cliente não basta: os modelos fixados na configuração local também precisam acompanhar
+      let lastModels;
+      try { lastModels = await modelsApply(String(body.name || '')); } catch (e) { lastModels = { error: e.message, applied: [], rows: [] }; }
+      if (TTY && lastModels.applied.length) event('ok', `modelos de ${C.bold(String(body.name))}: ${lastModels.applied.join(' · ')}`);
+      if (TTY && lastModels.error) event('bad', `modelos de ${C.bold(String(body.name))}: ${lastModels.error}`);
+      return send(res, 200, { ...(await state()), lastModels });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/models/apply') {
+      // só os modelos fixados da conta, sem reinstalar a CLI (contas que dividem a mesma CLI com outra já atualizada)
+      const body = await readBody(req);
+      let lastModels;
+      try { lastModels = await modelsApply(String(body.name || '')); } catch (e) { lastModels = { error: e.message, applied: [], rows: [] }; }
+      if (TTY && lastModels.applied.length) event('ok', `modelos de ${C.bold(String(body.name))}: ${lastModels.applied.join(' · ')}`);
+      if (TTY && lastModels.error) event('bad', `modelos de ${C.bold(String(body.name))}: ${lastModels.error}`);
+      return send(res, 200, { ...(await state()), lastModels });
     }
     if (req.method === 'POST' && url.pathname === '/api/skills/deps') {
       const body = await readBody(req);
@@ -2998,12 +3273,12 @@ if (require.main !== module) {
     HOME, CONFIG, IS_WIN, IS_MAC, IS_WSL, systemInfo, systemDetails, repoInfo, TYPES, DEFAULT_INSTALL, SELF_UPDATING, NODE_MIN, installCmd,
     INSTALL_WAYS, METHOD_LABEL, PKG_METHODS, wayCmd, classifyInstall, installInfo, installInfoFrom, installInfos, resolveInstall, npmNeedsSudo, npmPrefix, SYS_PMS, sysPkgOf,
     run, runShell, shellArgs, which, whichAll, python, pyRun, expandHome, homeRel, spawnArgs, winQuote, fullEnv, renameSafe, rmSafe,
-    readAccounts, writeAccounts, validateAccounts, parseConfig, inferType,
+    readAccounts, writeAccounts, validateAccounts, parseConfig, inferType, effectiveType, bedrockSource, claudeSettingsEnv, awsEnvOf,
     awsProfiles, iniSections, AWS_CONFIG, AWS_CREDENTIALS,
     loginStatus, codexLogin, geminiLogin, copilotLogin, claudeRelogin, detectAccounts,
     skillTargets, skillMeta, fetchSource, parseSource, installSkills, updateSkill, copySkill, removeSkill, checkDeps, installDeps, readSkillLock,
     inferDeps, depsFor, catalogItemOf, codeLines,
-    bedrockCheck, bedrockApply, toolInventory, versions, installed,
+    bedrockCheck, bedrockApply, modelsCheck, modelsApply, MODEL_SOURCES, toolInventory, versions, installed,
     instrTargets, instructionsState, saveInstruction, removeInstruction, scanGarbage, cleanGarbage,
     dropSources: () => { for (const entry of [...sourceCache.values(), ...retired]) dropSource(entry); sourceCache.clear(); retired.clear(); },
   };

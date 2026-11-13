@@ -390,6 +390,11 @@
   .bed-table td .id { display: block; font: 12px ui-monospace, Menlo, monospace; color: var(--muted); overflow-wrap: anywhere; }
   .bed-table .arrow { color: var(--muted); }
   .bed-table .tag { white-space: nowrap; }
+  .upd-h { margin: 18px 0 6px; font-size: 12px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+  .upd-h:first-child { margin-top: 0; }
+  .upd-lines { margin: 4px 0 0; padding: 0; list-style: none; font-size: 13px; color: var(--text-2); }
+  .upd-lines li { overflow-wrap: anywhere; }
+  .upd-lines code { font-size: 12px; }
   .row.removing { animation: row-out .28s ease forwards; pointer-events: none; }
   @keyframes row-out { to { opacity: 0; transform: translateX(18px); } }
   @media (prefers-reduced-motion: reduce) { .row.removing { animation: none; opacity: 0; } }
@@ -885,8 +890,11 @@
           <p>Cada conta abre a CLI certa, já com login, perfil e pasta configurados.</p>
         </div>
         <div class="section-actions">
-          <button class="btn sm" id="btn-update-all" hidden title="Instala a versão mais recente de cada CLI (novos modelos e recursos)">
-            <svg class="i"><use href="#i-refresh"/></svg>Atualizar CLIs
+          <button class="btn sm" id="btn-refresh" title="Confere de novo as contas desta máquina: login, versões instaladas e contas novas ainda não cadastradas. Não instala nada.">
+            <svg class="i"><use href="#i-refresh"/></svg>Atualizar
+          </button>
+          <button class="btn sm" id="btn-update-all" hidden title="Baixa e instala a versão mais recente de cada CLI e fixa os modelos mais novos (pode levar alguns minutos)">
+            <svg class="i"><use href="#i-download"/></svg>Atualizar versões das CLIs
           </button>
           <button class="btn primary sm" id="btn-new" title="Nova conta (atalho: N)">
             <svg class="i"><use href="#i-plus"/></svg>Nova conta<kbd class="hide-sm" aria-hidden="true">N</kbd>
@@ -1275,6 +1283,17 @@
   </form>
 </dialog>
 
+<dialog id="dlg-update" class="modal" aria-labelledby="upd-title" aria-describedby="upd-sub" style="width:min(640px, calc(100vw - 32px))">
+  <form method="dialog">
+    <div class="dlg-head">
+      <div><h3 id="upd-title">Resumo da atualização</h3><p id="upd-sub"></p></div>
+      <button type="button" class="btn ghost icon" data-close aria-label="Fechar"><svg class="i"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="dlg-body" id="upd-body"></div>
+    <div class="dlg-foot"><button class="btn primary" value="close">Fechar</button></div>
+  </form>
+</dialog>
+
 <dialog id="dlg-garbage" class="modal" aria-labelledby="gb-title" aria-describedby="gb-sub" style="width:min(600px, calc(100vw - 32px))">
   <form method="dialog" id="form-garbage" novalidate>
     <div class="dlg-head">
@@ -1472,10 +1491,12 @@ function render() {
   $('#brand-mascot').innerHTML = mascot(state.accounts.length && missingAccounts().length ? 'worried' : 'happy');
   const updatable = updatableAccounts();
   const upd = $('#btn-update-all');
-  upd.hidden = updatable.length === 0;
+  upd.hidden = updatable.length === 0 && !state.accounts.some((a) => ['claude', 'bedrock', 'codex', 'gemini', 'copilot'].includes(a.type) && isInstalled(a));
   const updatingAll = [...busy.values()].includes('update');
   upd.disabled = busy.size > 0;
-  upd.innerHTML = updatingAll ? '<span class="spin"></span>Atualizando…' : `${icon('refresh')}Atualizar CLIs`;
+  upd.innerHTML = updatingAll ? '<span class="spin"></span>Atualizando versões…' : `${icon('download')}Atualizar versões das CLIs`;
+  $('#btn-refresh').disabled = busy.size > 0 || refreshing;
+  $('#btn-refresh').innerHTML = refreshing ? '<span class="spin"></span>Conferindo…' : `${icon('refresh')}Atualizar`;
   if (state.system) { $('#sys-chip').hidden = false; $('#sys-label').textContent = state.system.label; }
   if (state.repo) { $('#repo-chip').hidden = false; $('#repo-chip').href = state.repo.url; $('#repo-label').textContent = state.repo.name; }
   renderOnboarding();
@@ -1576,6 +1597,7 @@ function accountCard(a, i) {
   const chips = [];
   const dir = a.env.CLAUDE_CONFIG_DIR || a.env.CODEX_HOME || a.env.COPILOT_HOME || a.env.GEMINI_CLI_HOME;
   if (dir && a.type !== 'bedrock') chips.push(`<span class="chip mono" title="Pasta de login">${esc(dir)}</span>`);
+  if (a.type === 'bedrock' && a.bedrockFrom && a.bedrockFrom !== 'config') chips.push(`<span class="chip" title="${esc(a.bedrockFrom === 'settings' ? `CLAUDE_CODE_USE_BEDROCK=1 está no settings.json de ${dir || '~/.claude'}` : 'CLAUDE_CODE_USE_BEDROCK=1 está no ambiente do seu shell')}">Bedrock via ${a.bedrockFrom === 'settings' ? 'settings.json' : 'shell'}</span>`);
   // por onde a CLI foi instalada: é por esse meio que o hub atualiza
   if (ok && a.installMethod) chips.push(`<span class="chip" title="${esc(a.installPath ? `Instalada em ${a.installPath}` : 'Meio de instalação')}${a.installCmd ? `&#10;Atualiza com: ${esc(a.installCmd)}` : ''}">via ${esc(a.installMethod)}</span>`);
   const installNote = !job && a.installNote && (!ok || !SELF_UPDATING.includes(a.command))
@@ -1602,6 +1624,7 @@ function accountCard(a, i) {
 }
 
 let detected = [];
+let refreshing = false;
 async function loadDetected() {
   try { detected = (await api('GET', '/api/detect')).found; } catch { detected = []; }
   renderDetected();
@@ -2173,7 +2196,7 @@ function renderAws() {
 
 let step = 1;
 let pending = null;
-let dirTouched = false;
+let dirTouched = false, ownLogin = false;
 // No Gemini, GEMINI_CLI_HOME é a pasta mãe (ele cria .gemini dentro).
 const LOGIN_DIR = { claude: '~/.claude', codex: '~/.codex', gemini: '~/.gemini', copilot: '~/.copilot' };
 const LOGIN_ENV = { claude: 'CLAUDE_CONFIG_DIR', codex: 'CODEX_HOME', gemini: 'GEMINI_CLI_HOME', copilot: 'COPILOT_HOME' };
@@ -2219,13 +2242,31 @@ const currentId = () => $('#f-name').value.trim() || 'id';
 function updateIdPreviews() { $$('.id-preview').forEach((el) => { el.textContent = currentId(); }); syncDir(); }
 
 function syncDir() {
-  const cb = $('#f-separate'), dir = $('#f-dir'), base = LOGIN_DIR[selectedType()];
-  if (!cb || !dir || !base || dirTouched) return;
+  const dir = $('#f-dir'), base = LOGIN_DIR[selectedType()];
+  if (!dir || !base) return;
+  if (dirTouched) { $$('.dir-preview').forEach((el) => { el.textContent = dir.value.trim() || base; }); return; }
   // comando "claude-trabalho" vira ~/.claude-trabalho, não ~/.claude-claude-trabalho
   const tool = base.replace('~/.', '');
   const suffix = currentId().replace(new RegExp(`^${tool}-?`), '') || 'hub';
-  dir.value = cb.checked ? `${base}-${suffix}` : '';
+  // nunca sugere uma pasta que outra conta já usa (ex.: a do Bedrock, que também é ~/.claude-…)
+  const used = new Set(state.accounts.filter((a, j) => j !== editing).map((a) => a.env[LOGIN_ENV[selectedType()]]).filter(Boolean));
+  let own = `${base}-${suffix}`;
+  for (let n = 2; used.has(own); n++) own = `${base}-${suffix}-${n}`;
+  dir.value = ownLogin ? own : '';
+  $$('.dir-preview').forEach((el) => { el.textContent = dir.value || base; });
 }
+
+// Outras contas da mesma ferramenta já cadastradas no hub. Assinatura e Bedrock do Claude contam juntas:
+// as duas são o Claude Code e dividem ~/.claude quando não têm pasta própria.
+function sameToolAccounts(type) {
+  if (!LOGIN_ENV[type]) return [];
+  const family = type === 'claude' ? ['claude', 'bedrock'] : [type];
+  return state.accounts.filter((a, j) => j !== editing && family.includes(a.type));
+}
+
+// Dessas, as que ocupam a pasta de login padrão: uma conta nova ali herdaria o login
+// (e o Bedrock ligado no settings.json) da outra.
+const defaultLoginTaken = (type) => sameToolAccounts(type).filter((a) => !a.env[LOGIN_ENV[type]]);
 
 function renderStepTool(type) {
   const t = TYPES[type];
@@ -2255,24 +2296,20 @@ function renderTypeFields(type, env = {}) {
   }
   if (LOGIN_DIR[type]) {
     const envKey = LOGIN_ENV[type];
-    const sameType = state.accounts.filter((a, j) => a.type === type && j !== editing);
-    const separate = Boolean(env[envKey]) || (editing == null && sameType.length > 0);
+    // A primeira conta de uma ferramenta usa a pasta padrão dela. Da segunda em diante (assinatura ou Bedrock),
+    // o hub já separa o login sozinho: não há o que marcar, e a pasta vem preenchida em "Mais opções".
+    const existing = editing == null ? sameToolAccounts(type) : [];
+    ownLogin = existing.length > 0;
     dirTouched = Boolean(env[envKey]);
     box.innerHTML = `
-      <label class="check"><input type="checkbox" id="f-separate" ${separate ? 'checked' : ''}>
-        <span><strong>Separar o login desta conta</strong><br>
-        <span class="sub">${sameType.length
-          ? `Você já tem ${sameType.length === 1 ? 'outra conta' : `${sameType.length} contas`} ${esc(t.title)} no hub. Marque para esta usar um login próprio.`
-          : `Marque se for usar mais de uma conta ${esc(t.title)}. Cada uma fica com seu próprio login.`}</span></span>
-      </label>
+      ${ownLogin ? `<div class="callout">${icon('shield')}<span>Você já tem <b>${esc(existing.map((a) => `${a.label}${a.type === 'bedrock' ? ' (AWS Bedrock)' : ''}`).join(', '))}</b> no hub. Esta conta nova já fica com login próprio, em <code class="dir-preview"></code>: no primeiro uso, é só entrar com a outra conta.</span></div>` : ''}
       ${loginSteps(type === 'copilot' ? '<p class="hint" style="margin-top:8px">O Copilot CLI precisa do Node.js 22 ou mais novo.</p>'
         : type === 'gemini' ? '<p class="hint" style="margin-top:8px">A chave não fica no hub: guarde-a em <code>~/.gemini/.env</code> como <code>GEMINI_API_KEY=…</code>, que o Gemini CLI lê sozinho.</p>' : '')}`;
     if (type === 'gemini') box.insertAdjacentHTML('afterbegin', geminiNotice());
     adv.innerHTML = `<div class="field"><label for="f-dir">Pasta do login</label>
       <input class="input mono" type="text" id="f-dir" value="${esc(env[envKey] || '')}" placeholder="${LOGIN_DIR[type]} (padrão)" spellcheck="false">
-      <p class="hint">Preenchida automaticamente quando você marca "Separar o login".</p></div>`;
-    $('#f-separate').addEventListener('change', () => { dirTouched = false; syncDir(); });
-    $('#f-dir').addEventListener('input', (e) => { dirTouched = true; $('#f-separate').checked = Boolean(e.target.value.trim()); });
+      <p class="hint">Vazio usa a pasta padrão da ferramenta. Quando você já tem outra conta dela no hub, o hub preenche uma pasta própria sozinho.</p></div>`;
+    $('#f-dir').addEventListener('input', () => { dirTouched = true; syncDir(); });
     syncDir();
   } else if (type === 'bedrock') {
     const hasProfiles = state.awsProfiles.length > 0;
@@ -2463,6 +2500,13 @@ function collectAccount() {
     env[l.slice(0, i).trim()] = l.slice(i + 1).trim();
   }
   const dir = $('#f-dir')?.value.trim();
+  if (editing == null && LOGIN_ENV[type] && !dir) {
+    const taken = defaultLoginTaken(type);
+    if (taken.length) {
+      $('#advanced').open = true;
+      errors.push(fieldError($('#f-dir'), `${LOGIN_DIR[type]} já é a pasta de login de ${taken.map((a) => a.label).join(', ')}. Informe uma pasta própria para esta conta.`));
+    }
+  }
   if (type === 'claude' && dir) env.CLAUDE_CONFIG_DIR = dir;
   if (type === 'codex' && dir) env.CODEX_HOME = dir;
   if (type === 'copilot' && dir) env.COPILOT_HOME = dir;
@@ -2529,7 +2573,7 @@ function renderReview({ account: a, newProfile }) {
 }
 
 async function saveAccounts(accounts, okMsg) {
-  state = await api('PUT', '/api/accounts', { accounts: accounts.map(({ installCmd, installMethod, installPath, installNote, installNeedsSudo, login, ...a }) => a) });
+  state = await api('PUT', '/api/accounts', { accounts: accounts.map(({ installCmd, installMethod, installPath, installNote, installNeedsSudo, bedrockFrom, login, ...a }) => a) });
   toolsLoaded = false;
   render();
   toast(okMsg);
@@ -2541,25 +2585,63 @@ function setBusy(btn, on, label) {
   else if (btn.dataset.label) btn.innerHTML = btn.dataset.label;
 }
 
-async function runJob(account, job) {
+// quiet: sem avisos individuais (o "Atualizar versões das CLIs" mostra um resumo no fim).
+async function runJob(account, job, { quiet = false } = {}) {
   const before = state.versions?.[account.command];
+  const out = { command: account.command, before, after: before, error: '', models: null };
+  const say = (msg, kind) => { if (!quiet) toast(msg, kind); };
   busy.set(account.command, job);
   render();
-  toast(`${job === 'update' ? 'Atualizando' : 'Instalando'} ${account.command}… pode levar um minuto.`, 'info');
+  say(`${job === 'update' ? 'Atualizando' : 'Instalando'} ${account.command}… pode levar um minuto.`, 'info');
   try {
     state = await api('POST', job === 'update' ? '/api/update' : '/api/install', { name: account.name });
-    const after = state.versions?.[account.command];
-    if (job === 'install' && !state.installed[account.command]) toast(`${account.command} instalado, mas ainda não aparece no PATH: abra um terminal novo e o hub de novo.`, 'bad');
-    else if (job === 'install') toast(`${account.command} instalado${after ? ` (v${after})` : ''}. No primeiro uso, faça login nele.`);
-    else if (before && after && before === after) toast(`${account.command} já está na versão mais recente (v${after}).`);
-    else toast(`${account.command} atualizado${before && after ? `: v${before} → v${after}` : ''}.`);
+    const after = out.after = state.versions?.[account.command];
+    out.models = state.lastModels || null;
+    const applied = out.models?.applied || [];
+    const models = applied.length ? ` ${applied.length === 1 ? 'Modelo atualizado' : 'Modelos atualizados'}: ${applied.join('; ')}.` : '';
+    if (job === 'install' && !state.installed[account.command]) say(`${account.command} instalado, mas ainda não aparece no PATH: abra um terminal novo e o hub de novo.`, 'bad');
+    else if (job === 'install') say(`${account.command} instalado${after ? ` (v${after})` : ''}. No primeiro uso, faça login nele.`);
+    else if (before && after && before === after) say(`${account.command} já está na versão mais recente (v${after}).${models}`);
+    else say(`${account.command} atualizado${before && after ? `: v${before} → v${after}` : ''}.${models}`);
+    if (out.models?.error) say(`Modelos de ${account.label}: ${out.models.error}`, 'bad');
   } catch (err) {
-    toast(err.message, 'bad');
+    out.error = err.message;
+    say(err.message, 'bad');
   } finally {
     busy.delete(account.command);
     toolsLoaded = false;
     render();
   }
+  return out;
+}
+
+// Resumo do "Atualizar versões das CLIs": o que mudou em cada CLI e nos modelos fixados de cada conta.
+function showUpdateSummary(clis, models) {
+  const tag = (cls, txt) => `<span class="tag ${cls}">${esc(txt)}</span>`;
+  const cliRows = clis.map((c) => `<tr><td><b>${esc(c.command)}</b></td><td>${
+    c.error ? `<span class="id" style="color:inherit">${esc(c.error.split('\n')[0])}</span>`
+    : c.before && c.after && c.before !== c.after ? `v${esc(c.before)} <span class="arrow">→</span> <b>v${esc(c.after)}</b>` : c.after ? `v${esc(c.after)}` : '<span class="none">versão desconhecida</span>'
+  }</td><td>${c.error ? tag('warn', 'falhou') : c.before !== c.after ? tag('ok', 'atualizada') : tag('', 'já na mais recente')}</td></tr>`).join('');
+  const modelRows = models.map(({ label, r }) => {
+    const applied = r.applied || [], rows = r.rows || [];
+    const notes = rows.filter((x) => x.note && ['advice', 'managed', 'unknown'].includes(x.status)).map((x) => x.note);
+    const [cls, txt] = r.error ? ['warn', 'não conferido'] : applied.length ? ['ok', `${applied.length} ${applied.length === 1 ? 'atualizado' : 'atualizados'}`]
+      : rows.some((x) => x.status === 'advice') ? ['warn', 'troca manual'] : rows.some((x) => ['ok', 'ahead'].includes(x.status)) ? ['', 'já no mais recente'] : ['', 'nada fixado'];
+    const lines = r.error ? [esc(r.error)] : [...applied.map((x) => `<code>${esc(x)}</code>`), ...notes.map(esc),
+      ...(!applied.length && !notes.length && cls === '' && txt === 'nada fixado' ? [esc(r.note || rows[0]?.note || 'usa o modelo padrão da ferramenta, que acompanha a versão instalada')] : [])];
+    return `<tr><td><b>${esc(label)}</b>${r.source ? `<span class="id">${esc(r.source)}</span>` : ''}</td>
+      <td>${lines.length ? `<ul class="upd-lines">${lines.map((l) => `<li>${l}</li>`).join('')}</ul>` : ''}${applied.length && r.file ? `<span class="id">gravado em ${esc(r.file)} (cópia em .bak)</span>` : ''}</td>
+      <td>${tag(cls, txt)}</td></tr>`;
+  }).join('');
+  const nCli = clis.filter((c) => !c.error && c.before !== c.after).length;
+  const nMod = models.reduce((n, m) => n + (m.r.applied || []).length, 0);
+  const failed = clis.filter((c) => c.error).length + models.filter((m) => m.r.error).length;
+  $('#upd-sub').textContent = `${nCli} ${nCli === 1 ? 'CLI atualizada' : 'CLIs atualizadas'} · ${nMod} ${nMod === 1 ? 'modelo atualizado' : 'modelos atualizados'}${failed ? ` · ${failed} com problema` : ''}`;
+  $('#upd-body').innerHTML = `
+    ${clis.length ? `<h4 class="upd-h">Versões das CLIs</h4><table class="bed-table"><tbody>${cliRows}</tbody></table>` : ''}
+    ${models.length ? `<h4 class="upd-h">Modelos de cada conta</h4><table class="bed-table"><tbody>${modelRows}</tbody></table>
+      <p class="hint" style="margin:14px 0 0">O hub só troca modelos que estavam fixados numa versão antiga, consultando a fonte oficial de cada ferramenta. Apelidos (<code>opus</code>, <code>sonnet</code>…) e contas sem modelo fixado já acompanham a CLI. Reabra a conta para usar os modelos novos.</p>` : ''}`;
+  $('#dlg-update').showModal();
 }
 
 function connMarkup(stateName, status, details = '') {
@@ -2901,7 +2983,7 @@ $('#sys-chip').addEventListener('click', async () => {
 let bedSeq = 0;
 const BED_STATUS = {
   ok: ['ok', 'em dia'], new: ['', 'vai fixar'], update: ['warn', 'vai atualizar'],
-  missing: ['', 'indisponível'], ahead: ['ok', 'mais novo fixado'], custom: ['', 'ARN próprio (não muda)'],
+  missing: ['', 'indisponível'], ahead: ['ok', 'mais novo fixado'], custom: ['', 'ARN próprio (não muda)'], managed: ['', 'fixado pela organização (não muda)'],
 };
 async function openBedrock(a) {
   const tok = ++bedSeq;
@@ -3372,8 +3454,44 @@ $('#form-skill').addEventListener('submit', async (e) => {
   if (!targets.length) return ($('#sk-error').textContent = 'Escolha pelo menos um agente.');
   try { await runSkillInstall(skills, targets); } catch (err) { toast(err.message, 'bad'); }
 });
+// "Atualizar versões das CLIs": instala a versão mais recente de cada CLI (uma vez por comando) e depois
+// confere os modelos fixados de TODAS as contas, já que duas contas da mesma CLI têm configurações separadas.
+const MODEL_TYPES = ['claude', 'bedrock', 'codex', 'gemini', 'copilot'];
 $('#btn-update-all').addEventListener('click', async () => {
-  for (const acc of updatableAccounts()) await runJob(acc, 'update');
+  const clis = [], byAccount = new Map();
+  const names = state.accounts.filter((a) => MODEL_TYPES.includes(a.type)).map((a) => [a.name, a.label]);
+  for (const acc of updatableAccounts()) {
+    const r = await runJob(acc, 'update', { quiet: true });
+    clis.push(r);
+    if (r.models) byAccount.set(acc.name, r.models);
+  }
+  busy.set(' modelos', 'update'); render();
+  try {
+    for (const [name] of names) {
+      if (byAccount.has(name)) continue;
+      try { state = await api('POST', '/api/models/apply', { name }); byAccount.set(name, state.lastModels); }
+      catch (err) { byAccount.set(name, { error: err.message, applied: [], rows: [] }); }
+    }
+  } finally { busy.delete(' modelos'); render(); }
+  showUpdateSummary(clis, names.filter(([n]) => byAccount.has(n)).map(([n, label]) => ({ label, r: byAccount.get(n) })));
+});
+// "Atualizar" só confere de novo: login e status de cada conta, versões instaladas e contas novas na máquina.
+$('#btn-refresh').addEventListener('click', async () => {
+  if (refreshing) return;
+  refreshing = true; render();
+  const before = { logins: JSON.stringify(state.accounts.map((a) => [a.name, a.login?.state, a.login?.who, a.login?.note])), versions: JSON.stringify(state.versions), found: detected.length };
+  try {
+    state = await api('POST', '/api/login/refresh', {});
+    toolsLoaded = false;
+    await loadDetected();
+    const changed = [];
+    if (JSON.stringify(state.accounts.map((a) => [a.name, a.login?.state, a.login?.who, a.login?.note])) !== before.logins) changed.push('status de login');
+    if (JSON.stringify(state.versions) !== before.versions) changed.push('versões instaladas');
+    if (detected.length > before.found) changed.push(`${detected.length - before.found} conta(s) nova(s) encontrada(s)`);
+    else if (detected.length) changed.push(`${detected.length} conta(s) da máquina ainda fora do hub`);
+    toast(changed.length ? `Atualizado: ${changed.join(', ')}.` : 'Tudo conferido: nada mudou.');
+  } catch (err) { toast(err.message, 'bad'); }
+  finally { refreshing = false; render(); }
 });
 document.addEventListener('keydown', (e) => {
   const irow = e.target.closest?.('.instr-row');

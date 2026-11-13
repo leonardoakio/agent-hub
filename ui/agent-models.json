@@ -38,7 +38,7 @@
         "copilot",
         "antigravity"
       ],
-      "extra": "No AWS Bedrock: Opus 5.5, Sonnet 4.5, Haiku 4.5 e Fable 5.2"
+      "extra": "No AWS Bedrock: Fable 5.2, Opus 5.5, Sonnet 5.5 e Haiku 5.5 (o hub fixa os IDs no settings.json da conta)"
     },
     "gpt": {
       "title": "GPT",

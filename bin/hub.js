@@ -147,7 +147,7 @@ function loadConfig() {
       envList.push([pair.slice(0, j), lib.expandHome(pair.slice(j + 1))]);
     }
     const a = { name: c.name, label: c.label, command: c.command, args: c.args, install: c.install, env, envList };
-    a.type = lib.TYPES.includes(c.rawType) ? c.rawType : lib.inferType(a);
+    a.type = lib.effectiveType({ ...a, type: lib.TYPES.includes(c.rawType) ? c.rawType : lib.inferType(a) });
     ACC.push(a);
     byName.set(a.name, a);
   }
@@ -156,7 +156,7 @@ function loadConfig() {
 const installed = (a) => findExe(a.command) !== '';
 const envVal = (a, key) => { let v = ''; for (const [k, x] of a.envList) if (k === key) v = x; return v; };
 const accountEnv = (a) => Object.assign({}, process.env, Object.fromEntries(a.envList));
-const isBedrock = (a) => a.envList.some(([k, v]) => k === 'CLAUDE_CODE_USE_BEDROCK' && (v === '1' || v === 'true'));
+const isBedrock = (a) => a.type === 'bedrock';
 
 function missing(names) {
   const list = names && names.length ? names : ACC.map((a) => a.name);
@@ -505,6 +505,26 @@ async function bedrockModelsUpdate(names = []) {
     for (const c of r.applied || []) echo(`  ${GREEN}✓${N} ${c}`);
     if (!(r.applied || []).length) echo(`  ${GREEN}✓${N} já estavam no mais recente ${GRAY}(${r.region} · ${r.file})${N}`);
     for (const x of r.rows || []) if (x.status === 'missing') echo(`  ${GRAY}○ ${x.family}: nenhum modelo disponível nesta conta/região${N}`);
+    for (const x of r.rows || []) if (x.status === 'managed') echo(`  ${GRAY}○ ${x.key}: fixado pela organização em ${r.managedFile || 'managed-settings.json'}: o hub não altera${N}`);
+  }
+  return 0;
+}
+
+// Modelos fixados das demais ferramentas (Claude de assinatura, Codex, Gemini, Copilot): confere na fonte oficial
+// de cada uma e troca só o que estava preso numa versão antiga. Bedrock fica com bedrockModelsUpdate.
+async function modelsUpdate(names = []) {
+  for (const a of ACC) {
+    if (names.length && !names.includes(a.name)) continue;
+    if (isBedrock(a) || !['claude', 'codex', 'gemini', 'copilot'].includes(a.type)) continue;
+    let r;
+    try { r = await withTimeout(lib.modelsApply(a.name), 60000); } catch (e) { r = e && e.timeout ? { error: 'a consulta demorou demais' } : { error: e.message }; }
+    echo(`${TEAL}→${N} modelos de ${B}${a.label}${N}${r && r.source ? ` ${GRAY}(${r.source})${N}` : ''}`);
+    if (!r || r.error) { echo(`  ${RED}✗${N} ${(r && r.error) || 'não consegui conferir'}`); continue; }
+    for (const c of r.applied || []) echo(`  ${GREEN}✓${N} ${c} ${GRAY}· ${r.file}${N}`);
+    const rows = r.rows || [];
+    for (const x of rows) if (x.note && ['advice', 'managed', 'unknown'].includes(x.status)) echo(`  ${YEL}!${N} ${x.label}: ${x.note}`);
+    if (!(r.applied || []).length && rows.some((x) => x.status === 'ok' || x.status === 'ahead')) echo(`  ${GREEN}✓${N} já estavam no mais recente ${GRAY}(${r.file})${N}`);
+    else if (!(r.applied || []).length && rows.every((x) => x.status === 'auto')) echo(`  ${GRAY}○ nada fixado: acompanha a versão da CLI${N}`);
   }
   return 0;
 }
@@ -810,10 +830,30 @@ async function refreshLogins() {
   await Promise.all(ACC.filter(installed).map(refreshLogin));
 }
 
+// Modelos novos no Bedrock só entram se o ID for fixado no settings.json: ao abrir a conta, o hub confere
+// (no máximo uma vez por dia por conta) e avisa; a troca em si fica para /update ou o botão da interface.
+const BEDROCK_HINT_FILE = path.join(path.dirname(CONFIG), 'bedrock-models.json');
+async function bedrockModelsHint(a) {
+  let cache = {};
+  try { cache = JSON.parse(fs.readFileSync(BEDROCK_HINT_FILE, 'utf8')) || {}; } catch {}
+  const hit = cache[a.name];
+  if (hit && Date.now() - hit.at < 24 * 60 * 60 * 1000 && !process.env.HUB_BEDROCK_RECHECK) {
+    if (hit.changes) echo(`${YEL}!${N} modelos novos no Bedrock para ${B}${a.label}${N}: ${hit.what} ${GRAY}· rode /update para fixar${N}`);
+    return;
+  }
+  let r = null;
+  try { r = await withTimeout(lib.bedrockCheck(a.name), 20000); } catch { return; }
+  if (!r) return;
+  const what = (r.rows || []).filter((x) => x.status === 'new' || x.status === 'update').map((x) => x.latestLabel || x.family).join(', ');
+  cache[a.name] = { at: Date.now(), changes: r.changes || 0, what };
+  try { fs.mkdirSync(path.dirname(BEDROCK_HINT_FILE), { recursive: true, mode: 0o700 }); fs.writeFileSync(BEDROCK_HINT_FILE, JSON.stringify(cache, null, 2), { mode: 0o600 }); } catch {}
+  if (r.changes) echo(`${YEL}!${N} modelos novos no Bedrock para ${B}${a.label}${N}: ${what} ${GRAY}· rode /update para fixar no ${r.file}${N}`);
+}
+
 async function awsReady(a, env) {
   if (!isBedrock(a)) return true;
-  const profile = envVal(a, 'AWS_PROFILE');
-  const accEnv = Object.fromEntries(a.envList);
+  const accEnv = { ...lib.awsEnvOf({ command: a.command, env: Object.fromEntries(a.envList) }), ...Object.fromEntries(a.envList) };
+  const profile = accEnv.AWS_PROFILE || '';
   if (!findExe('aws')) {
     echo(`${YEL}!${N} AWS CLI não instalado: não dá para conferir as credenciais de ${a.label}`);
     return true;
@@ -821,6 +861,7 @@ async function awsReady(a, env) {
   const who = await lib.run('aws', ['sts', 'get-caller-identity', '--query', 'Account', '--output', 'text'], 15000, accEnv);
   if (who.ok) {
     echo(`${GREEN}✓${N} credenciais AWS ok ${GRAY}(perfil ${profile || 'padrão'} · conta ${who.stdout})${N}`);
+    await bedrockModelsHint(a);
     return true;
   }
   const sso = profile && ((await lib.run('aws', ['configure', 'get', 'sso_start_url', '--profile', profile], 10000, accEnv)).ok
@@ -944,9 +985,10 @@ async function check() {
     const inst = installed(a);
     const version = inst ? first(await lib.run(a.command, ['--version'], 15000)) : '';
     const how = await howInstalled(a);
-    const profile = envVal(a, 'AWS_PROFILE');
+    // contas Bedrock sem AWS_PROFILE no config usam o perfil do settings.json, do shell ou o "default"
+    const profile = envVal(a, 'AWS_PROFILE') || (isBedrock(a) ? lib.awsEnvOf({ command: a.command, env: Object.fromEntries(a.envList) }).AWS_PROFILE || 'default' : '');
     let aws = null;
-    if (profile && hasAws) aws = (await lib.run('aws', ['sts', 'get-caller-identity'], 20000, Object.fromEntries(a.envList))).ok;
+    if (profile && hasAws) aws = (await lib.run('aws', ['sts', 'get-caller-identity'], 20000, { ...Object.fromEntries(a.envList), AWS_PROFILE: profile })).ok;
     return { a, inst, version, profile, aws, how };
   }));
   for (const { a, inst, version, profile, aws, how } of rows) {
@@ -1248,7 +1290,7 @@ async function runItem(item) {
       }
       case 'check': await check(); echo(); await pause(); break;
       case 'install': echo(); await installMissing([]); echo(); await pause(); break;
-      case 'update': echo(); await updateInstalled([]); await bedrockModelsUpdate([]); echo(); await pause(); break;
+      case 'update': echo(); await updateInstalled([]); await bedrockModelsUpdate([]); await modelsUpdate([]); echo(); await pause(); break;
       case 'skills':
         SKILL_DONE = '';
         await skillsMenu();
@@ -1375,7 +1417,7 @@ async function main(argv) {
     case '-h': case '--help': case 'help': usage(); return 0;
     case 'ui': return openUi();
     case 'install': return installMissing(rest);
-    case 'update': await updateInstalled(rest); return bedrockModelsUpdate(rest);
+    case 'update': await updateInstalled(rest); await bedrockModelsUpdate(rest); return modelsUpdate(rest);
     case 'skills': return skillsMenu();
     case 'skill': {
       const [skill, accName] = rest;

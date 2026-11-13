@@ -77,7 +77,7 @@ Clique em **Nova conta** e siga os 3 passos: ferramenta, detalhes e revisão:
 </tr>
 </table>
 
-Quer duas contas da mesma ferramenta? Marque **Separar o login desta conta** e cada uma terá seu próprio login.
+Quer duas contas da mesma ferramenta? É só adicionar a segunda: quando já existe uma conta dela no hub (no Claude, vale tanto assinatura quanto AWS Bedrock), a nova já recebe uma pasta de login própria, sem nada para marcar. Para escolher outra pasta, use **Mais opções → Pasta do login**.
 
 Enquanto a interface está aberta, o terminal mostra o endereço; aperte `q` para voltar ao menu:
 
@@ -96,7 +96,7 @@ Também dá para ir direto: `hub claude-aws`. Argumentos extras vão para a CLI:
 | `/ui` | abre a interface no navegador |
 | `/verify` | confere quais CLIs estão instaladas e se as credenciais AWS funcionam |
 | `/install` | instala as CLIs cadastradas que faltam |
-| `/update` | atualiza as CLIs para a versão mais recente, pelo mesmo meio em que foram instaladas |
+| `/update` | atualiza as CLIs para a versão mais recente, pelo mesmo meio em que foram instaladas, e troca os modelos fixados numa versão antiga pelo mais recente de cada conta |
 | `/skills` | lista e instala skills a partir do GitHub |
 | `/quit` | sai (ou `Esc`) |
 
@@ -149,7 +149,9 @@ Cadastre o perfil AWS pela própria interface (ou use um perfil que já existe e
 
 Se o perfil usa SSO e a sessão venceu, o hub roda `aws sso login` antes de abrir a conta.
 
-**Modelos sempre atualizados:** no Bedrock, o Claude Code só usa um modelo novo (ex.: um Fable ou Sonnet que acabou de sair) se o ID dele estiver fixado no `settings.json` da conta. No card da conta Bedrock, o botão de modelos consulta a AWS (`aws bedrock list-inference-profiles`) com o perfil e a região da conta, mostra o que está fixado e o mais recente disponível de cada família (Fable, Opus, Sonnet, Haiku) e atualiza com um clique. Só as variáveis `ANTHROPIC_DEFAULT_*_MODEL` mudam, mantendo o resto do arquivo e uma cópia em `settings.json.bak`. O `/update` do terminal faz o mesmo.
+**Bedrock detectado onde estiver:** o hub reconhece uma conta como Bedrock quando `CLAUDE_CODE_USE_BEDROCK=1` está no `env` da conta, no `settings.json` da pasta de login ou no ambiente do shell, na mesma ordem que o Claude Code usa. Região e perfil AWS seguem a mesma regra. O card mostra de onde veio ("Bedrock via settings.json") quando não está no config do hub.
+
+**Modelos sempre atualizados:** no Bedrock, o Claude Code só usa um modelo novo (ex.: um Fable ou Sonnet que acabou de sair) se o ID dele estiver fixado no `settings.json` da conta. No card da conta Bedrock, o botão de modelos consulta a AWS (`aws bedrock list-inference-profiles`) com o perfil e a região da conta, mostra o que está fixado e o mais recente disponível de cada família (Fable, Opus, Sonnet, Haiku) e atualiza com um clique. Só as variáveis `ANTHROPIC_DEFAULT_*_MODEL` mudam, mantendo o resto do arquivo e uma cópia em `settings.json.bak`. O `/update` do terminal faz o mesmo. O prefixo que você já usa (`global.`, `us.`, `eu.`…) é preservado quando a versão nova existe com ele. IDs fixados pela organização no `managed-settings.json` (em `/etc/claude-code` no Linux, `/Library/Application Support/ClaudeCode` no macOS ou `%ProgramData%\ClaudeCode` no Windows) têm prioridade e o hub não os altera, só avisa. Ao abrir uma conta Bedrock pelo terminal, o hub confere uma vez por dia se há modelo novo e avisa; a troca fica para o `/update`.
 
 Para remover um perfil, use a lixeira ao lado dele: o hub apaga a seção dele em `~/.aws/credentials` e `~/.aws/config`, sem tocar nos outros. Se alguma conta do hub usa o perfil, ele avisa e pede que você digite o nome para confirmar:
 
@@ -195,7 +197,9 @@ Ao abrir, o hub confere se existe versão nova no repositório de onde você clo
 Se você tiver alterações locais, ele não atualiza por cima e mostra o comando para fazer à mão.
 Não quer a checagem? Use `HUB_NO_UPDATE=1 hub`.
 
-As CLIs são atualizadas com `/update` (ou o botão **Atualizar CLIs** na interface), sempre para a versão mais recente.
+As CLIs são atualizadas com `/update` (ou o botão **Atualizar versões das CLIs** na interface), sempre para a versão mais recente. O botão **Atualizar**, ao lado, não instala nada: só confere de novo o login e o status de cada conta, as versões instaladas e se há conta nova na máquina ainda fora do hub.
+
+Junto com as CLIs, os dois também atualizam os **modelos fixados** de todas as contas: um ID preso numa versão antiga (ex.: `claude-fable-5-1` no `settings.json`, `model = "gpt-5.5"` no `config.toml` do Codex, `gemini-3.5-flash` no Gemini CLI) vai para o mais recente da mesma família, consultado na fonte oficial de cada ferramenta (documentação da Anthropic, repositórios `openai/codex` e `google-gemini/gemini-cli`, e a própria conta AWS no Bedrock). Apelidos (`opus`, `sonnet`…) e contas sem modelo fixado não mudam, porque já acompanham a CLI. No Copilot o hub só avisa, e a troca é pelo `/model`. Cada arquivo alterado ganha uma cópia `.bak`, e a interface mostra um resumo do que mudou em cada CLI e em cada conta.
 
 O hub olha onde cada CLI está instalada e atualiza pelo mesmo meio, em vez de assumir npm para tudo. `/verify` e o card da conta mostram o meio detectado (ex.: "via instalador oficial"):
 

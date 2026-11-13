@@ -170,6 +170,15 @@ A seção **Limpeza** tem duas partes.
 
 <img src="docs/limpeza.png" width="760" alt="Lixo encontrado por IA">
 
+## Desinstalar
+
+Dois níveis, sempre rodando dentro da pasta do projeto:
+
+- **Só o comando `hub`:** `./uninstall.sh` (Windows: `.\uninstall.ps1`). Suas contas em `~/.config/hub` ficam, para o caso de instalar de novo.
+- **Tudo do hub:** `./uninstall.sh --all` (Windows: `.\uninstall.ps1 -All`). Mostra a lista, pede confirmação e remove o comando, as contas e dados do hub e a linha de PATH que o instalador criou. No final, mostra o comando para apagar a pasta do projeto.
+
+Nos dois níveis, as CLIs, seus logins, skills e instruções continuam onde estão: eles funcionam sem o hub.
+
 ## Seus dados
 
 - **Sistema detectado automaticamente.** O instalador e o hub identificam o sistema (Linux, macOS, Windows ou WSL) antes de qualquer ação, e tudo é instalado e gravado no padrão dele. O sistema aparece no menu, no `/verify` e no topo da interface. Clicando nele, você vê onde cada coisa é gravada.
@@ -195,7 +204,6 @@ As CLIs são atualizadas com `/update` (ou o botão **Atualizar CLIs** na interf
 - **Modelos (LLMs) por skill:** lidos das páginas oficiais (Anthropic, OpenAI, Google, Antigravity, GitHub) e guardados em `~/.config/hub/agent-models.json`; só o que mudou é regravado.
 - **Pastas de skills:** `~/.claude/skills`, `~/.codex/skills`, `~/.gemini/skills`, `~/.gemini/antigravity-cli/skills`, `~/.copilot/skills` e `~/.agents/skills` (ou as pastas de login separadas de cada conta).
 - **Instalar sem animação:** `HUB_FAST=1 ./install.sh`.
-- **Desinstalar:** `./install.sh --uninstall` (no Windows: `.\install.ps1 -Uninstall`).
 
 </details>
 

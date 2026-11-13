@@ -1,5 +1,5 @@
 ﻿# Se o Windows recusar o script: powershell -ExecutionPolicy Bypass -File .\install.ps1
-param([switch]$Uninstall)
+param([switch]$Uninstall, [switch]$Purge)
 
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
@@ -39,10 +39,7 @@ function IsOurs([string]$file) {
   return ($text -match [regex]::Escape($Marker)) -and ($text -match [regex]::Escape($Target))
 }
 
-if ($Uninstall) {
-  Write-Host ''
-  Mascot '• ~ •' 'Removendo o comando hub…' 'suas contas e logins não são apagados'
-  Write-Host ''
+function RemoveShim {
   if (IsOurs $Shim) {
     Remove-Item -LiteralPath $Shim -Force
     Ok 'comando removido' (Short $Shim)
@@ -51,11 +48,59 @@ if ($Uninstall) {
   } else {
     Warn 'nada para remover' "$(Short $Shim) não existe"
   }
+}
+# Tira a pasta do PATH do usuário só se ela ficou vazia (outros programas também usam ~\.local\bin).
+function RemovePathEntry {
+  if ((Test-Path -LiteralPath $BinDir) -and @(Get-ChildItem -LiteralPath $BinDir -Force).Count -gt 0) { Ok 'PATH mantido' "$(Short $BinDir) tem outros programas"; return }
+  if (Test-Path -LiteralPath $BinDir) { Remove-Item -LiteralPath $BinDir -Force }
+  $envKey = Get-Item -Path 'HKCU:\Environment'
+  $rawUser = [string]$envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+  $norm = { param($p) ([Environment]::ExpandEnvironmentVariables($p)).TrimEnd('\') }
+  $parts = @($rawUser -split ';' | Where-Object { $_ -ne '' })
+  $keep = @($parts | Where-Object { (& $norm $_) -ine $BinDir.TrimEnd('\') })
+  if ($keep.Count -eq $parts.Count) { return }
+  $newPath = $keep -join ';'
+  if ($rawUser -match '%') { Set-ItemProperty -Path 'HKCU:\Environment' -Name 'Path' -Value $newPath -Type ExpandString }
+  else { [Environment]::SetEnvironmentVariable('Path', $newPath, 'User') }
+  Ok 'PATH do usuário limpo' "$(Short $BinDir) removido"
+}
+function Bye([string]$hint) {
   Write-Host ''
   Write-Host '  (^ ◡ ^)/' -ForegroundColor Cyan -NoNewline
   Write-Host '  até mais! ' -NoNewline
-  Write-Host "para apagar também as contas: Remove-Item -Recurse $(Short (Split-Path -Parent $Config))" -ForegroundColor DarkGray
+  Write-Host $hint -ForegroundColor DarkGray
   Write-Host ''
+}
+
+if ($Uninstall) {
+  Write-Host ''
+  Mascot '• ~ •' 'Removendo o comando hub…' 'suas contas e logins não são apagados'
+  Write-Host ''
+  RemoveShim
+  Bye 'para apagar tudo do hub: .\uninstall.ps1 -All'
+  exit 0
+}
+
+if ($Purge) {
+  $confDir = Split-Path -Parent $Config
+  Write-Host ''
+  Mascot '• ~ •' 'Apagando tudo do hub…' 'as CLIs, seus logins, skills e instruções continuam'
+  Write-Host ''
+  Write-Host '  Vai sair:' -ForegroundColor White
+  Write-Host "    • comando $(Short $Shim)"
+  Write-Host "    • contas e dados do hub em $(Short $confDir)"
+  Write-Host "    • $(Short $BinDir) do PATH do usuário, se ficar vazia"
+  Write-Host '  Fica: ' -ForegroundColor White -NoNewline
+  Write-Host "a pasta deste repositório ($(Short $Repo)); o comando para apagá-la aparece no final."
+  Write-Host ''
+  $reply = Read-Host '  Continuar? [s/N]'
+  if ($reply -notmatch '^[sSyY]') { Fail 'cancelado' 'nada foi apagado'; exit 1 }
+  Write-Host ''
+  RemoveShim
+  if (Test-Path -LiteralPath $confDir) { Remove-Item -LiteralPath $confDir -Recurse -Force; Ok 'contas e dados removidos' (Short $confDir) }
+  else { Ok 'sem dados para remover' "$(Short $confDir) não existe" }
+  RemovePathEntry
+  Bye "para apagar a pasta do projeto: Remove-Item -Recurse -Force '$(Short $Repo)'"
   exit 0
 }
 
@@ -156,5 +201,5 @@ Step 'hub' 'abre o menu'
 Step '/ui' 'cadastra suas contas e credenciais'
 Step '/install' 'instala as CLIs das contas (sempre a versão mais recente)'
 Write-Host ''
-Write-Host '  # para remover depois: .\install.ps1 -Uninstall' -ForegroundColor DarkGray
+Write-Host '  # para remover depois: .\uninstall.ps1 (tudo, inclusive as contas: .\uninstall.ps1 -All)' -ForegroundColor DarkGray
 Write-Host ''

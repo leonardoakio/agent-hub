@@ -69,15 +69,52 @@ mascot() {
 
 [[ -t 1 ]] && trap 'tput cnorm 2>/dev/null || true' EXIT
 
-if [[ ${1:-} == --uninstall ]]; then
-  echo
-  mascot "• ~ •" "Removendo o comando hub…" "${GRAY}suas contas e logins não são apagados${N}"
-  echo
+remove_link() {
   spin "removendo $(short "$LINK")"
   if [[ -L $LINK && $(link_target "$LINK") == "$(cd -P "$REPO" && pwd)/bin/hub" ]]; then rm "$LINK"; ok "comando removido" "$(short "$LINK")"
   elif [[ -e $LINK || -L $LINK ]]; then warn "não removi" "$(short "$LINK") aponta para outro lugar, não para este repositório"
   else warn "nada para remover" "$(short "$LINK") não existe"; fi
-  printf '\n  %s(^ ◡ ^)/%s  até mais! %spara apagar também as contas: rm -r %s%s\n\n' "$TEAL" "$N" "$GRAY" "$(short "$(dirname "$CONFIG")")" "$N"
+}
+
+# Só a linha que este instalador escreveu (marcada com "# agent-hub"); o resto do arquivo fica como está.
+remove_path_line() {
+  local rc tmp
+  for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+    [[ -f $rc ]] && grep -qx '# agent-hub' "$rc" || continue
+    tmp=$(mktemp "$rc.XXXXXX")
+    awk 'prev == "# agent-hub" && /^export PATH="\$HOME\/\.local\/bin:\$PATH"$/ { prev = ""; next } { if (prev != "") print prev; prev = $0 } END { if (prev != "" && prev != "# agent-hub") print prev }' "$rc" >"$tmp"
+    cat "$tmp" >"$rc" && rm -f "$tmp"
+    ok "linha do PATH removida" "${rc/#$HOME/\~}"
+  done
+}
+
+if [[ ${1:-} == --uninstall ]]; then
+  echo
+  mascot "• ~ •" "Removendo o comando hub…" "${GRAY}suas contas e logins não são apagados${N}"
+  echo
+  remove_link
+  printf '\n  %s(^ ◡ ^)/%s  até mais! %spara apagar tudo do hub: ./uninstall.sh --all%s\n\n' "$TEAL" "$N" "$GRAY" "$N"
+  exit 0
+fi
+
+if [[ ${1:-} == --purge ]]; then
+  CONF_DIR=$(dirname "$CONFIG")
+  echo
+  mascot "• ~ •" "Apagando tudo do hub…" "${GRAY}as CLIs, seus logins, skills e instruções continuam${N}"
+  echo
+  printf '  %sVai sair:%s\n' "$B" "$N"
+  printf '    • comando %s\n' "$(short "$LINK")"
+  printf '    • contas e dados do hub em %s\n' "$(short "$CONF_DIR")"
+  printf '    • a linha do PATH que o instalador colocou no seu .bashrc/.zshrc\n'
+  printf '  %sFica:%s a pasta deste repositório (%s); o comando para apagá-la aparece no final.\n\n' "$B" "$N" "$(short "$REPO")"
+  reply=n
+  [[ -t 0 ]] && { read -rp "  Continuar? [s/N] " reply || reply=n; }
+  if [[ $reply != [sSyY]* ]]; then fail "cancelado" "nada foi apagado"; exit 1; fi
+  echo
+  remove_link
+  if [[ -d $CONF_DIR ]]; then rm -rf "$CONF_DIR"; ok "contas e dados removidos" "$(short "$CONF_DIR")"; else ok "sem dados para remover" "$(short "$CONF_DIR") não existe"; fi
+  remove_path_line
+  printf '\n  %s(^ ◡ ^)/%s  até mais! %spara apagar a pasta do projeto: rm -rf %s%s\n\n' "$TEAL" "$N" "$GRAY" "$(short "$REPO")" "$N"
   exit 0
 fi
 
@@ -212,4 +249,4 @@ fi
 printf '  %s%d%s  %shub%s       %sabre o menu%s\n' "$TEAL" $((step++)) "$N" "$B" "$N" "$GRAY" "$N"
 printf '  %s%d%s  %s/ui%s       %scadastra suas contas e credenciais%s\n' "$TEAL" $((step++)) "$N" "$B" "$N" "$GRAY" "$N"
 printf '  %s%d%s  %s/install%s  %sinstala as CLIs das contas (sempre a versão mais recente)%s\n' "$TEAL" $((step++)) "$N" "$B" "$N" "$GRAY" "$N"
-printf '\n  %s# para remover depois: ./install.sh --uninstall%s\n\n' "$GRAY" "$N"
+printf '\n  %s# para remover depois: ./uninstall.sh (tudo, inclusive as contas: ./uninstall.sh --all)%s\n\n' "$GRAY" "$N"

@@ -664,7 +664,7 @@ async function skillInstallDeps(folders, source = '') {
   let r;
   try { r = await lib.checkDeps(folders, opts); } catch (e) { r = { deps: [], steps: [], compat: {}, origin: {} }; out(`    ${YEL}!${N} não consegui conferir as dependências: ${e.message}\n`); }
   const steps = Array.isArray(r.steps) ? r.steps : [];
-  for (const [f, text] of Object.entries(r.compat || {})) out(`    ${GRAY}${folders.length > 1 ? `${f}: ` : ''}compatibilidade declarada: ${plain(text).slice(0, 200)}${N}\n`);
+  for (const [f, text] of Object.entries(r.compat || {})) out(`    ${GRAY}${folders.length > 1 ? `${plain(f)}: ` : ''}compatibilidade declarada: ${plain(text).slice(0, 200)}${N}\n`);
   if (!r.deps.length) {
     const inferred = Object.values(r.origin || {}).includes('inferida');
     out(`    ${GRAY}${inferred ? 'nenhuma dependência encontrada nos arquivos da skill' : 'nenhuma dependência extra'}${N}\n`);
@@ -678,10 +678,10 @@ async function skillInstallDeps(folders, source = '') {
     }
   }
   const autoSteps = steps.filter((s) => s.kind === 'auto'), manualSteps = steps.filter((s) => s.kind !== 'auto');
-  for (const s of autoSteps) out(`    ${GREEN}·${N} ${folders.length > 1 ? `${s.skill}: ` : ''}${plain(s.title)} ${GRAY}(${plain(s.detail)})${N}\n`);
+  for (const s of autoSteps) out(`    ${GREEN}·${N} ${folders.length > 1 ? `${plain(s.skill)}: ` : ''}${plain(s.title)} ${GRAY}(${plain(s.detail)})${N}\n`);
   if (manualSteps.length) {
     out(`    ${B}Depois de instalar${N} ${GRAY}(o SKILL.md pede; o hub não faz sozinho)${N}\n`);
-    for (const s of manualSteps) out(`    ${YEL}·${N} ${folders.length > 1 ? `${s.skill}: ` : ''}${plain(s.title)}${s.cmd ? ` ${GRAY}→ ${plain(s.cmd)}${N}` : ''}${s.detail ? ` ${GRAY}(${plain(s.detail)})${N}` : ''}\n`);
+    for (const s of manualSteps) out(`    ${YEL}·${N} ${folders.length > 1 ? `${plain(s.skill)}: ` : ''}${plain(s.title)}${s.cmd ? ` ${GRAY}→ ${plain(s.cmd)}${N}` : ''}${s.detail ? ` ${GRAY}(${plain(s.detail)})${N}` : ''}\n`);
   }
   if (!r.deps.length) return;
   const need = r.deps.filter((d) => !d.ok && !d.optional);
@@ -727,7 +727,7 @@ async function skillInstallDeps(folders, source = '') {
   if (viaLib || r.deps.some((d) => !d.ok && !d.optional && d.how === 'pip')) {
     let res;
     try { res = await spinRun('instalando as dependências…', lib.installDeps(folders, false, opts)); } catch (e) { res = { log: [`falhou: ${e.message}`] }; }
-    for (const l of res.log || []) out(`  ${/falhou/.test(l) ? `${RED}✗` : `${GREEN}✓`}${N} ${l}\n`);
+    for (const l of res.log || []) out(`  ${/falhou/.test(l) ? `${RED}✗` : `${GREEN}✓`}${N} ${plain(l)}\n`);
   }
 }
 
@@ -801,7 +801,7 @@ async function skillsUpdate(names = []) {
       }
       if (r.updated.length) echo(`${GREEN}✓${N} ${B}${folder}${N} atualizada para ${r.commit} (${r.date}) em ${r.updated.length} pasta(s)`);
       else echo(`${GREEN}✓${N} ${folder} ${GRAY}já na versão mais recente (${r.commit})${N}`);
-      for (const l of r.local || []) echo(`  ${/falhou|não está instalado/.test(l) ? `${YEL}!` : `${GREEN}✓`}${N} ${l}`);
+      for (const l of r.local || []) echo(`  ${/falhou|não está instalado/.test(l) ? `${YEL}!` : `${GREEN}✓`}${N} ${plain(l)}`);
     }
   } finally { lib.dropSources(); }
   return 0;
@@ -843,7 +843,7 @@ async function installSkillFrom(src, T) {
     }
     echo(`  encontrada(s): ${B}${found.map((s) => plain(s.folder) + ' ').join('')}${N}`);
     echo(`  versão:        ${fetched.commit} · ${fetched.date} ${GRAY}(a mais recente${fetched.branch ? ` da branch ${fetched.branch}` : ''}, baixada agora)${N}`);
-    for (const sk of found) if (sk.also && sk.also.length) echo(`  ${YEL}!${N} ${plain(sk.folder)} vem de ${sk.path}; há outra pasta com o mesmo nome (${sk.also.join(', ')}): para instalar aquela, cole o link dela`);
+    for (const sk of found) if (sk.also && sk.also.length) echo(`  ${YEL}!${N} ${plain(sk.folder)} vem de ${plain(sk.path)}; há outra pasta com o mesmo nome (${sk.also.map(plain).join(', ')}): para instalar aquela, cole o link dela`);
     const licenses = [...new Set(found.map((s) => plain(String(s.license || '')).trim()).filter(Boolean))];
     if (licenses.length) echo(`  licença:       ${licenses.join(', ')} ${GRAY}(declarada no SKILL.md)${N}`);
     echo(`  instalar em:   ${T.map((t) => t.label).join(' · ')}`);
@@ -853,13 +853,13 @@ async function installSkillFrom(src, T) {
     await skillInstallDeps(folders, src);
     echo();
     if (!(await ask('  Instalar a skill?'))) { echo('cancelado'); return 0; }
-    for (const f of folders.filter((x) => !SKILL_NAME_RE.test(x))) echo(`${YEL}!${N} nome inválido, pulando: ${f}`);
+    for (const f of folders.filter((x) => !SKILL_NAME_RE.test(x))) echo(`${YEL}!${N} nome inválido, pulando: ${plain(f)}`);
     const ok = folders.filter((x) => SKILL_NAME_RE.test(x));
     if (!ok.length) return 0;
     try {
       const r = await lib.installSkills({ source: src, skills: ok, targets: T.map((t) => t.dir) });
       for (const f of r.installed) echo(`${GREEN}✓${N} ${B}${f}${N} instalada em ${r.targets.length} pasta(s): reabra a CLI para carregar`);
-      for (const l of r.local || []) echo(`  ${/falhou|não está instalado/.test(l) ? `${YEL}!` : `${GREEN}✓`}${N} ${l}`);
+      for (const l of r.local || []) echo(`  ${/falhou|não está instalado/.test(l) ? `${YEL}!` : `${GREEN}✓`}${N} ${plain(l)}`);
     } catch (e) {
       echo(`${RED}✗${N} ${e.message}`);
       return 1;
@@ -1692,5 +1692,5 @@ if (require.main === module) {
     process.exit(1);
   });
 } else {
-  module.exports = { resolveExe, skillPromptArgs, truncateDesc, resolveCmd, suggestCmd, paintText, splitWords, pad, padEnd, shq, gradient, loadConfig, skillTargets, installedSkills, getAccounts: () => ACC };
+  module.exports = { plain, resolveExe, skillPromptArgs, truncateDesc, resolveCmd, suggestCmd, paintText, splitWords, pad, padEnd, shq, gradient, loadConfig, skillTargets, installedSkills, getAccounts: () => ACC };
 }

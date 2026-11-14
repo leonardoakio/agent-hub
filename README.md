@@ -154,7 +154,7 @@ Skills são instruções extras (`SKILL.md`) que os agentes carregam sozinhos: a
 - **Sugestões prontas** de fontes oficiais (Cloudflare, OpenAI, Anthropic, Vercel), ou cole qualquer repositório do GitHub: `dono/repositório`, `dono/repositório@branch`, o link do GitHub (https ou SSH, inclusive de uma pasta ou branch específica), um link do skills.sh ou a linha `npx skills add …`. A branch do link é respeitada na instalação e nas atualizações seguintes.
 - **Sempre a versão mais recente**, baixada na hora do repositório oficial.
 - **Dependências conferidas antes**: pacotes Python e Node o hub instala sozinho (se o npm global for do root, mostra o comando com `sudo`); programas do sistema ele instala pelo Homebrew no macOS, pelo `apt`, `dnf`, `zypper`, `yum`, `pacman` ou `apk` no Linux (o terminal roda com sudo; a interface mostra o comando) e pelo `winget` no Windows.
-- **Repositórios fora do catálogo**: o hub deduz as dependências pelos arquivos da própria skill (`requirements.txt`, `pyproject.toml`, `package.json`, imports dos scripts Python e Node, comandos `pip`, `npm -g`, `brew` e `apt` citados no SKILL.md, o campo `dependencies` do cabeçalho e programas conhecidos que os scripts chamam, como LibreOffice, pandoc, poppler, ffmpeg e Tesseract) e mostra a evidência de cada uma. Versões pedidas no `requirements.txt` são respeitadas, e se a skill traz um `package.json` com dependências o hub roda `npm install` na pasta dela ao instalar (sem scripts de pós-instalação). Também lê a licença e o campo `compatibility` do SKILL.md, exibe um trecho do README e lista os passos que o SKILL.md pede e o hub não faz sozinho, como variáveis de ambiente e comandos de setup. A tabela curada do hub só vale para a skill do catálogo vinda do repositório oficial; uma pasta de mesmo nome em outro repositório é analisada pelos próprios arquivos.
+- **Repositórios fora do catálogo**: o hub deduz as dependências pelos arquivos da própria skill (`requirements.txt`, `pyproject.toml`, `package.json`, imports dos scripts Python e Node, comandos `pip`, `npm -g`, `brew` e `apt` citados no SKILL.md, o campo `dependencies` do cabeçalho e programas conhecidos que os scripts chamam, como LibreOffice, pandoc, poppler, ffmpeg e Tesseract) e mostra a evidência de cada uma. Versões pedidas no `requirements.txt` são respeitadas, e se a skill traz um `package.json` com dependências o hub roda `npm install` na pasta dela ao instalar (sem scripts de pós-instalação). Esse passo só é automático quando os pacotes vêm do registro do npm e a skill não traz um `.npmrc` próprio: com `.npmrc`, `workspaces` ou dependências de git, URL ou pasta local, o hub avisa e deixa o `npm install` para você, depois de conferir a skill. Também lê a licença e o campo `compatibility` do SKILL.md, exibe um trecho do README e lista os passos que o SKILL.md pede e o hub não faz sozinho, como variáveis de ambiente e comandos de setup. A tabela curada do hub só vale para a skill do catálogo vinda do repositório oficial; uma pasta de mesmo nome em outro repositório é analisada pelos próprios arquivos.
 - **Aviso de versão nova**: a interface confere o GitHub em segundo plano e marca as skills cujo repositório mudou; **Atualizar N skills** baixa todas de uma vez. No terminal: `hub skills update` (ou a opção "Atualizar as skills instaladas" em `/skills`).
 - **Suas edições ficam protegidas**: se você mudou uma skill na sua máquina depois de instalar, o hub avisa e só sobrescreve com a sua confirmação.
 - **Mais contas**: leve uma skill instalada para outras contas com um clique.
@@ -212,7 +212,8 @@ Nos dois níveis, as CLIs, seus logins, skills e instruções continuam onde est
 - Os logins continuam nas pastas de cada ferramenta (`~/.claude`, `~/.codex`, …) e as chaves AWS em `~/.aws`, gerenciadas pelo AWS CLI.
 - A interface roda só no seu computador (`127.0.0.1`), com um token novo a cada abertura, e nunca envia chaves completas para a página: chaves AWS e variáveis como `GEMINI_API_KEY` ou `GH_TOKEN` aparecem mascaradas.
 - O config do hub é gravado só para o seu usuário (permissão 600), e quem tem acesso a ele pode rodar comandos como você: o campo `install` de cada conta é executado no terminal. Use só comandos de fonte confiável.
-- Skills vêm de repositórios do GitHub que você escolhe: o hub mostra a origem e a versão antes de instalar e não copia links que apontem para fora da skill.
+- Skills vêm de repositórios do GitHub que você escolhe: o hub mostra a origem e a versão antes de instalar e não copia links que apontem para fora da skill, nem links que passem por outro link.
+- O navegador é aberto com um link de uso único, que vale 1 minuto (demorou? aperte `o` de novo) e é cancelado se o navegador não abrir. No Linux, a interface só atende conexões do seu próprio usuário; as recusadas aparecem na lista de atividade do terminal. Se você acessa a interface por um túnel ou proxy que roda como outro usuário, use `HUB_UI_ANY_USER=1 hub` para desligar essa conferência.
 
 ## Atualizações
 
@@ -264,6 +265,14 @@ Os instaladores do hub (`install.sh` e `install.ps1`) também oferecem instalar 
 - **Instalar sem animação:** `HUB_FAST=1 ./install.sh`.
 
 </details>
+
+## Testes
+
+Os testes das proteções de segurança (instalação de skills, links, abertura da interface, limpeza, modelos do Codex) rodam com o próprio Node, sem instalar nada, numa pasta temporária:
+
+```bash
+node --test test/
+```
 
 ## Licença
 

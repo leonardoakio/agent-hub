@@ -32,11 +32,19 @@ const IS_WSL = !IS_WIN && (Boolean(process.env.WSL_DISTRO_NAME) || (() => { try 
 // WSL: CLIs do lado Windows (/mnt/c) não recebem o env de cada conta; não contam como instaladas.
 const winSide = (p) => IS_WSL && /^\/mnt\/[a-z]\//.test(p);
 const winQuote = (a) => (/^[A-Za-z0-9_\-.:\\/=@+,]+$/.test(String(a)) ? String(a) : `"${String(a).replace(/"/g, '""')}"`);
+// Windows procura um programa chamado só pelo nome primeiro na pasta atual, e o "where" também. Para um arquivo
+// plantado numa pasta de projeto (claude.cmd, where.exe, cmd.exe…) não rodar no lugar do instalado, os programas do
+// sistema são chamados pelo caminho completo e o "where" roda a partir da pasta do sistema (sobra só o PATH).
+const WIN_SYS = path.join(process.env.SystemRoot || process.env.windir || 'C:\\Windows', 'System32');
+const winSysExe = (name) => { const f = path.join(WIN_SYS, name); return IS_WIN && fs.existsSync(f) ? f : name; };
+const WIN_WHERE = winSysExe('where.exe');
+const WIN_CMD = winSysExe('cmd.exe');
+const whereOpts = () => (IS_WIN && fs.existsSync(WIN_SYS) ? { cwd: WIN_SYS } : {});
 const whereCache = new Map();
 function whereWin(cmd) {
   if (/[\\/]/.test(cmd)) return cmd;
   if (!whereCache.has(cmd)) {
-    const r = spawnSync('where', [cmd], { encoding: 'utf8', windowsHide: true });
+    const r = spawnSync(WIN_WHERE, [cmd], { encoding: 'utf8', windowsHide: true, ...whereOpts() });
     whereCache.set(cmd, r.status === 0 ? r.stdout.split(/\r?\n/).filter(Boolean)[0] : '');
   }
   return whereCache.get(cmd) || cmd;
@@ -45,10 +53,10 @@ function whereWin(cmd) {
 function spawnArgs(cmd, args) {
   if (!IS_WIN) return [cmd, args, {}];
   const full = whereWin(cmd);
-  if (/\.(cmd|bat)$/i.test(full)) return ['cmd.exe', ['/d', '/s', '/c', `"${[full, ...args].map(winQuote).join(' ')}"`], { windowsVerbatimArguments: true }];
+  if (/\.(cmd|bat)$/i.test(full)) return [WIN_CMD, ['/d', '/s', '/c', `"${[full, ...args].map(winQuote).join(' ')}"`], { windowsVerbatimArguments: true }];
   return [full, args, {}];
 }
-const shellArgs = (line) => (IS_WIN ? ['cmd.exe', ['/d', '/s', '/c', `"${line}"`], { windowsVerbatimArguments: true }] : ['bash', ['-c', line], {}]);
+const shellArgs = (line) => (IS_WIN ? [WIN_CMD, ['/d', '/s', '/c', `"${line}"`], { windowsVerbatimArguments: true }] : ['bash', ['-c', line], {}]);
 const PATH_SEP = path.delimiter;
 
 // Repositório de onde este hub foi clonado (remote origin): mostrado no topo da interface, sem nome fixo no código.
@@ -57,7 +65,8 @@ function repoInfo() {
   if (repoCache !== undefined) return repoCache;
   repoCache = null;
   try {
-    const r = spawnSync('git', ['-C', path.join(__dirname, '..'), 'remote', 'get-url', 'origin'], { encoding: 'utf8', windowsHide: true });
+    const [file, argv, extra] = spawnArgs('git', ['-C', path.join(__dirname, '..'), 'remote', 'get-url', 'origin']);
+    const r = spawnSync(file, argv, { encoding: 'utf8', windowsHide: true, ...extra });
     const m = (r.stdout || '').trim().match(/^(?:https?:\/\/|git@)([^/:]+)[/:]([^/]+)\/([^/]+?)(?:\.git)?\/?$/);
     if (r.status === 0 && m) repoCache = { name: `${m[2]}/${m[3]}`, url: `https://${m[1]}/${m[2]}/${m[3]}` };
   } catch {}
@@ -743,7 +752,7 @@ const fullEnv = () => ({ ...process.env, [FULL_ENV]: true });
 const runShell = (line, timeout, env) => run('', [], timeout, env, shellArgs(line));
 
 async function whichAll(cmd) {
-  const r = IS_WIN ? await run('where', [cmd], 5000, undefined, ['where', [cmd], {}]) : await run('which', ['-a', cmd], 5000);
+  const r = IS_WIN ? await run('where', [cmd], 5000, undefined, [WIN_WHERE, [cmd], whereOpts()]) : await run('which', ['-a', cmd], 5000);
   return r.ok ? r.stdout.split(/\r?\n/).map((x) => x.trim()).filter((x) => x && !winSide(x)) : [];
 }
 const which = async (cmd) => (await whichAll(cmd)).length > 0;
@@ -1123,6 +1132,8 @@ function readmeExcerpt(src, folders) {
 // Pacotes npm podem ter escopo (@org/pacote); nomes só viram argumentos de execFile, nunca shell.
 const DEP_NAME_RE = /^(@[A-Za-z0-9._-]{1,64}\/)?[A-Za-z0-9._-]{1,64}$/;
 const PY_MOD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+// Pacote do gerenciador do sistema: no apt, um hífen no fim do nome ("pacote-") manda remover em vez de instalar.
+const sysPkgOk = (p) => DEP_NAME_RE.test(p) && !p.endsWith('-');
 
 // ---- Inferência de dependências de uma skill desconhecida, pelos arquivos dela ----
 // Módulos da biblioteca padrão do Python (não são dependências).
@@ -1243,7 +1254,7 @@ function inferDeps(dir, folder) {
     for (const key of ['apt', 'dnf', 'zypper', 'pacman', 'apk', 'brew', 'brewCask', 'winget', 'manual']) if (k[key] && d[key] === undefined) d[key] = k[key];
   };
   const addSysPkg = (pkg, pm, evidence) => {
-    if (!DEP_NAME_RE.test(pkg)) return;
+    if (!sysPkgOk(pkg)) return;
     if (pm === 'brew' && /^--/.test(pkg)) return;
     const bin = PKG_BIN[pkg] !== undefined ? PKG_BIN[pkg] : pkg;
     if (!bin) return;
@@ -1280,7 +1291,9 @@ function inferDeps(dir, folder) {
       try { pkg = JSON.parse(readSmall(f) || ''); } catch {}
       const list = Object.keys({ ...(pkg && pkg.dependencies), ...(pkg && pkg.devDependencies) });
       const prod = Object.keys({ ...(pkg && pkg.dependencies) });
-      if (prod.length) steps.push({ kind: 'auto', title: `Pacotes Node dos scripts (${prod.slice(0, 6).join(', ')}${prod.length > 6 ? '…' : ''})`, detail: `o hub roda npm install na pasta ${path.dirname(r) === '.' ? 'da skill' : `${folder}/${path.dirname(r)}`} ao instalar, sem scripts de pós-instalação`, cmd: '', evidence: r });
+      const block = prod.length ? npmLocalBlock(path.dirname(f)) : '';
+      if (block) steps.push({ kind: 'cmd', title: `Pacotes Node dos scripts (${prod.slice(0, 6).join(', ')}${prod.length > 6 ? '…' : ''})`, detail: `o hub não instala sozinho: ${block}`, cmd: 'npm install', evidence: r });
+      else if (prod.length) steps.push({ kind: 'auto', title: `Pacotes Node dos scripts (${prod.slice(0, 6).join(', ')}${prod.length > 6 ? '…' : ''})`, detail: `o hub roda npm install na pasta ${path.dirname(r) === '.' ? 'da skill' : `${folder}/${path.dirname(r)}`} ao instalar, sem scripts de pós-instalação`, cmd: '', evidence: r });
       else if (list.length) steps.push({ kind: 'cmd', title: `Pacotes Node de desenvolvimento (${list.slice(0, 6).join(', ')}${list.length > 6 ? '…' : ''})`, detail: 'só para os testes da própria skill', cmd: 'npm install', evidence: r });
     }
   }
@@ -1465,7 +1478,8 @@ async function systemPm() {
   for (const pm of SYS_PMS) if (await which(pm.bin)) return pm;
   return null;
 }
-const sysPkgOf = (d, pm) => (d[pm.key] || (pm.fallbackKey && d.type === 'bin' ? d[pm.fallbackKey] : '') || (d.type === 'py' && d.apt && d.pip ? pm.py(d.pip) : '') || '');
+const sysPkgOf = (d, pm) => { const p = sysPkgRaw(d, pm); return /-(\s|$)/.test(p) ? '' : p; };
+const sysPkgRaw = (d, pm) => (d[pm.key] || (pm.fallbackKey && d.type === 'bin' ? d[pm.fallbackKey] : '') || (d.type === 'py' && d.apt && d.pip ? pm.py(d.pip) : '') || '');
 const MANUAL_URL = { node: 'https://nodejs.org', pip: 'https://pip.pypa.io/en/stable/installation/', brew: 'https://brew.sh' };
 
 // how de cada dependência que falta:
@@ -1627,6 +1641,28 @@ function insideDir(root, p) {
   const rel = path.relative(r, p);
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
+// Um link relativo de uma skill só é copiado se o texto dele, seguido componente a componente, nunca sai da pasta da
+// skill nem atravessa outro link. O texto é copiado como está e o sistema o resolve de novo no destino, onde as pastas
+// acima da skill são as do usuário: com um link no meio do caminho, "link/.." sobe mais do que o texto aparenta.
+function linkStaysInside(srcDir, f) {
+  try {
+    const text = fs.readlinkSync(f);
+    if (path.isAbsolute(text)) return false;
+    const root = fs.realpathSync(srcDir);
+    let cur = fs.realpathSync(path.dirname(f));
+    const segs = text.split(IS_WIN ? /[\\/]+/ : /\/+/).filter((x) => x && x !== '.');
+    for (let i = 0; i < segs.length; i++) {
+      if (segs[i] === '..') cur = path.dirname(cur);
+      else {
+        cur = path.join(cur, segs[i]);
+        if (i < segs.length - 1 && !fs.lstatSync(cur).isDirectory()) return false;
+      }
+      if (!insideDir(root, cur)) return false;
+    }
+    // o destino precisa existir (link quebrado não entra) e, resolvido, continuar dentro da skill
+    return insideDir(root, fs.realpathSync(f));
+  } catch { return false; }
+}
 function writeSourceLine(dir, line) {
   const f = path.join(dir, '.hub-source');
   try { fs.unlinkSync(f); } catch {}
@@ -1659,8 +1695,7 @@ function replaceSkillDir(srcDir, dest, sourceLine, fromRepo = false) {
     if (fromRepo && ['.hub-source', INSTR_SKILL_MARK].includes(path.basename(f))) return false;
     let st;
     try { st = fs.lstatSync(f); } catch { return false; }
-    if (!st.isSymbolicLink()) return true;
-    try { return !path.isAbsolute(fs.readlinkSync(f)) && insideDir(srcDir, fs.realpathSync(f)); } catch { return false; }
+    return !st.isSymbolicLink() || linkStaysInside(srcDir, f);
   };
   try { fs.cpSync(srcDir, fresh, { recursive: true, verbatimSymlinks: true, filter }); }
   catch (e) {
@@ -1710,12 +1745,33 @@ function localNodeDirs(dir) {
   walk(dir, 0);
   return out;
 }
+// Dependência que o npm resolve só pelo registro: faixa de versão, tag ou apelido npm:pacote@versão.
+// Git, URL, file:, link: e dono/repositório ficam de fora (o npm chamaria git ou leria caminhos escolhidos pelo repositório).
+const npmRegistrySpec = (v) => typeof v === 'string' && (!/[:\\/]/.test(v) || /^npm:(@[\w.-]+\/)?[\w.-]+(@[^:\\/]*)?$/.test(v));
+// Por que o hub não roda o npm sozinho numa pasta de skill ('' = pode rodar). O npm lê o .npmrc da pasta como
+// configuração do projeto (ex.: git=<script da skill>), e isso vale mais que o --ignore-scripts.
+function npmLocalBlock(d) {
+  if (lexists(path.join(d, '.npmrc'))) return 'a skill traz um .npmrc próprio; confira esse arquivo antes';
+  let pkg = null;
+  try { pkg = JSON.parse(readSmall(path.join(d, 'package.json')) || ''); } catch {}
+  if (!isObj(pkg)) return '';
+  if (pkg.workspaces !== undefined) return 'o package.json usa workspaces';
+  const specs = [];
+  for (const key of ['dependencies', 'optionalDependencies', 'peerDependencies']) if (isObj(pkg[key])) specs.push(...Object.entries(pkg[key]));
+  const flat = (o, depth) => { if (depth > 6) return; for (const [k, v] of Object.entries(o)) { if (isObj(v)) flat(v, depth + 1); else specs.push([k, v]); } };
+  if (isObj(pkg.overrides)) flat(pkg.overrides, 0);
+  const bad = [...new Set(specs.filter(([, v]) => !npmRegistrySpec(v)).map(([k]) => k))];
+  return bad.length ? `dependências de fora do registro do npm (${bad.slice(0, 4).join(', ')}${bad.length > 4 ? '…' : ''})` : '';
+}
 async function npmLocal(skillDir, folder) {
   const dirs = localNodeDirs(skillDir);
   if (!dirs.length) return [];
   if (!(await which('npm'))) return [`${folder}: os scripts usam pacotes Node, mas o npm não está instalado (https://nodejs.org). Depois rode npm install em ${homeRel(dirs[0])}`];
   const log = [];
   for (const d of dirs) {
+    // "falhou" é o que o terminal e a interface procuram para marcar a linha como aviso
+    const block = npmLocalBlock(d);
+    if (block) { log.push(`${folder}: falhou ao instalar os pacotes Node em ${homeRel(d)}: o hub não roda o npm sozinho nesse caso (${block}). Se confiar na skill, rode npm install nessa pasta`); continue; }
     const r = await run('npm', ['install', '--prefix', d, '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--no-package-lock', '--silent'], 10 * 60 * 1000);
     log.push(r.ok ? `${folder}: pacotes Node instalados em ${homeRel(d)}`
       : `${folder}: falhou ao instalar os pacotes Node em ${homeRel(d)} (${r.stderr.split('\n').filter(Boolean).pop() || 'npm falhou'}). Rode npm install nessa pasta`);
@@ -2937,7 +2993,9 @@ async function scanGarbage(accounts) {
   const tmp = os.tmpdir();
   const live = new Set([...sourceCache.values(), ...retired].map((e) => e.dir));
   let clones = [];
-  try { clones = fs.readdirSync(tmp).filter((n) => n.startsWith('hub-skill-')).map((n) => path.join(tmp, n)).filter((p) => !live.has(p) && fs.lstatSync(p).isDirectory()); } catch {}
+  // num /tmp compartilhado (Linux), pastas hub-skill-* de outros usuários não são sobras deste hub
+  const ownDir = (p) => { try { const st = fs.lstatSync(p); return st.isDirectory() && (typeof process.getuid !== 'function' || st.uid === process.getuid()); } catch { return false; } };
+  try { clones = fs.readdirSync(tmp).filter((n) => n.startsWith('hub-skill-')).map((n) => path.join(tmp, n)).filter((p) => !live.has(p) && ownDir(p)); } catch {}
   if (clones.length) {
     let size = 0;
     for (const c of clones) size += await du(c);
@@ -3437,6 +3495,7 @@ async function claudeModels(a) {
   } };
 }
 
+const CODEX_SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 // Codex: a linha model = "…" do topo do config.toml. O models.json oficial diz para qual modelo cada um migra.
 async function codexModels(a) {
   const file = path.join(a.env.CODEX_HOME ? expandHome(a.env.CODEX_HOME) : path.join(HOME, '.codex'), 'config.toml');
@@ -3452,15 +3511,25 @@ async function codexModels(a) {
   let list = [];
   try { list = JSON.parse(await fetchOfficial('codex')).models || []; } catch (e) { if (/não consegui/.test(e.message)) throw e; throw new Error('a lista oficial de modelos do Codex veio em formato inesperado'); }
   const by = new Map(list.map((m) => [m.slug, m]));
-  let next = cur, known = by.has(cur);
-  for (let i = 0; i < 6 && by.get(next)?.upgrade?.model && by.get(next).upgrade.model !== next; i++) next = by.get(next).upgrade.model;
+  let next = cur, known = by.has(cur), badNext = false;
+  // o sucessor vem de um arquivo remoto e vai para o config.toml: só vale um nome de modelo que a própria lista traz
+  for (let i = 0; i < 6; i++) {
+    const up = by.get(next)?.upgrade?.model;
+    if (!up || up === next) break;
+    if (typeof up !== 'string' || !CODEX_SLUG_RE.test(up) || !by.has(up)) { badNext = true; break; }
+    next = up;
+  }
   const row = !known ? modelRow('model', 'Modelo padrão', cur, '', 'unknown', 'não está na lista oficial do Codex: o hub não altera')
+    : badNext ? modelRow('model', 'Modelo padrão', cur, '', 'unknown', 'a lista oficial indica um sucessor fora do padrão: o hub não altera')
     : modelRow('model', 'Modelo padrão', cur, next, next !== cur ? 'update' : 'ok', next !== cur ? `a OpenAI indica ${by.get(next)?.display_name || next} como sucessor` : '');
   return { tool: 'codex', file, source: MODEL_SOURCES.codex.label, rows: [row], apply: (todo) => {
     if (!todo.length || at < 0) return;
     const fresh = (safeRead(file) || '').split('\n');
     if (!new RegExp(`^\\s*model\\s*=\\s*(["'])${cur.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\1`).test(fresh[at] || '')) throw new Error('o config.toml do Codex mudou durante a atualização: tente de novo');
-    fresh[at] = fresh[at].replace(cur, todo[0].latest);
+    const latest = String(todo[0].latest);
+    if (!CODEX_SLUG_RE.test(latest)) throw new Error('modelo sucessor inválido: o hub não altera o config.toml');
+    // troca só o valor entre aspas: recuo, aspas e comentário no fim da linha ficam como estavam
+    fresh[at] = fresh[at].replace(/^(\s*model\s*=\s*["'])[^"']+/, (_, pre) => pre + latest);
     saveWithBak(file, fresh.join('\n'));
   } };
 }
@@ -3723,11 +3792,48 @@ const OP_FIRST_STAGE = {
   'POST /api/skills/remove': ['Removendo a skill', 80],
 };
 
-let connected = false;
+// Linux: /proc/net/tcp (e tcp6, para sockets IPv4 mapeados) traz o usuário dono de cada socket da máquina.
+// Devolve o uid de quem abriu a conexão local peerPort → serverPort, ou null se ela não estiver na tabela.
+function peerUidFrom(table, peerPort, serverPort) {
+  const hex = (n) => Number(n).toString(16).toUpperCase().padStart(4, '0');
+  const loopback = (addr) => /(0100007F|7F000001)$/.test(addr);
+  for (const line of String(table).split('\n')) {
+    const f = line.trim().split(/\s+/);
+    if (f.length < 8 || !/^\d+$/.test(f[7])) continue;
+    const [la, lp] = f[1].split(':'), [ra, rp] = f[2].split(':');
+    if (lp === hex(peerPort) && rp === hex(serverPort) && loopback(la) && loopback(ra)) return Number(f[7]);
+  }
+  return null;
+}
+// O link de abertura (e o token, quando o terminal abre o link) passa pela linha de comando do navegador, que outros
+// usuários da máquina conseguem ler. No Linux a interface só atende conexões do próprio usuário: confere uma vez por
+// conexão. Devolve false só quando dá para afirmar que veio de outro usuário; na dúvida (outro sistema, WSL, tabela
+// ilegível, conexão por túnel que não aparece nela) segue como antes. HUB_UI_ANY_USER=1 desliga a conferência.
+const PEER_CHECK = process.platform === 'linux' && !IS_WSL && typeof process.getuid === 'function' && !process.env.HUB_UI_ANY_USER;
+const peerChecked = new WeakMap();
+function sameUserPeer(socket, serverPort) {
+  if (!PEER_CHECK) return true;
+  if (peerChecked.has(socket)) return peerChecked.get(socket);
+  let ok = true;
+  for (const table of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    let uid = null;
+    try { uid = peerUidFrom(fs.readFileSync(table, 'utf8'), socket.remotePort, serverPort); } catch {}
+    if (uid !== null) { ok = uid === process.getuid(); break; }
+  }
+  peerChecked.set(socket, ok);
+  return ok;
+}
+
+let connected = false, peerWarnedAt = 0;
 const server = http.createServer(async (req, res) => {
   const port = server.address().port;
   // Bloqueia DNS rebinding: só aceita o host local exato.
   if (![`127.0.0.1:${port}`, `localhost:${port}`].includes(req.headers.host)) return send(res, 403, { error: 'host' });
+  if (!sameUserPeer(req.socket, port)) {
+    // no máximo um aviso a cada 10 s: quem insiste não enche a tela
+    if (TTY && Date.now() - peerWarnedAt > 10000) { peerWarnedAt = Date.now(); event('bad', 'conexão de outro usuário desta máquina recusada'); }
+    return send(res, 403, { error: 'origem' });
+  }
   if (req.headers.origin && ![`http://127.0.0.1:${port}`, `http://localhost:${port}`].includes(req.headers.origin)) return send(res, 403, { error: 'origem' });
   const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -3742,8 +3848,14 @@ const server = http.createServer(async (req, res) => {
     let body = {};
     try { body = await readBody(req); } catch {}
     const code = String(body.code || '');
-    if (!openCodes.has(code)) return send(res, 401, { error: 'link expirado. Abra de novo com /ui no terminal' });
+    if (!openCodes.has(code)) {
+      if (usedCodes.has(code) && TTY) event('bad', 'um link de abertura já usado foi apresentado de novo. Se não foi você, feche a interface (q) e abra outra vez');
+      return send(res, 401, { error: 'link expirado. Abra de novo com /ui no terminal' });
+    }
     openCodes.delete(code);
+    usedCodes.add(code);
+    setTimeout(() => usedCodes.delete(code), 10 * 60 * 1000).unref();
+    if (TTY) event('ok', 'navegador autorizado pelo link de abertura');
     return send(res, 200, { token: TOKEN });
   }
   const icons = {
@@ -3985,18 +4097,21 @@ function event(kind, msg) {
   console.log(`  ${C.gray(now())}  ${mark} ${String(msg).replace(/\x1b(?!\[[0-9;]*m)|[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f-\x9f]/g, '')}`);
 }
 
-const openCodes = new Set();
+// Código de uso único do link de abertura: vale pouco tempo (o navegador o troca pelo token em segundos) e some na hora
+// se o navegador não abrir. usedCodes guarda por alguns minutos os já trocados, para avisar se alguém reapresentar um.
+const openCodes = new Set(), usedCodes = new Set();
+const OPEN_CODE_TTL = 60 * 1000;
 function openBrowser() {
   if (process.env.HUB_UI_NO_OPEN) return;
   const code = crypto.randomBytes(24).toString('hex');
   openCodes.add(code);
-  setTimeout(() => openCodes.delete(code), 5 * 60 * 1000).unref();
+  setTimeout(() => openCodes.delete(code), OPEN_CODE_TTL).unref();
   const fullUrl = `${baseUrl}#c=${code}`;
-  const [opener, args, opts] = IS_WIN ? ['rundll32', ['url.dll,FileProtocolHandler', fullUrl], {}]
+  const [opener, args, opts] = IS_WIN ? [winSysExe('rundll32.exe'), ['url.dll,FileProtocolHandler', fullUrl], {}]
     : IS_MAC ? ['open', [fullUrl], {}]
     : IS_WSL ? (fs.existsSync('/usr/bin/wslview') ? ['wslview', [fullUrl], {}] : ['cmd.exe', ['/c', 'start', '""', fullUrl.replace(/&/g, '^&')], { cwd: '/mnt/c' }])
     : ['xdg-open', [fullUrl], {}];
-  const fail = () => { if (TTY) event('info', `não consegui abrir o navegador. Abra este endereço: ${tokenUrl}`); };
+  const fail = () => { openCodes.delete(code); if (TTY) event('info', `não consegui abrir o navegador. Abra este endereço: ${tokenUrl}`); };
   const child = spawn(opener, args, { stdio: 'ignore', detached: true, windowsHide: true, ...opts });
   child.on('error', fail).on('exit', (code) => { if (code && !IS_WIN) fail(); });
   child.unref();
@@ -4079,6 +4194,7 @@ if (require.main !== module) {
     loginStatus, codexLogin, geminiLogin, copilotLogin, claudeRelogin, detectAccounts,
     skillTargets, skillMeta, fetchSource, parseSource, installSkills, updateSkill, copySkill, removeSkill, checkDeps, installDeps, readSkillLock,
     inferDeps, depsFor, catalogItemOf, codeLines, skillsCheck, updateAllSkills, dirHash, sourceRef, npmLocal,
+    npmLocalBlock, npmRegistrySpec, sysPkgOk, replaceSkillDir, linkStaysInside, peerUidFrom,
     bedrockCheck, bedrockApply, modelsCheck, modelsApply, MODEL_SOURCES, toolInventory, versions, installed,
     instrTargets, instructionsState, saveInstruction, removeInstruction, scanGarbage, cleanGarbage,
     dropSources: () => { for (const entry of [...sourceCache.values(), ...retired]) dropSource(entry); sourceCache.clear(); retired.clear(); },

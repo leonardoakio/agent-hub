@@ -1069,6 +1069,8 @@
           <label for="f-args" class="sub-label" id="launch-args-label">Argumentos</label>
           <input class="input mono" type="text" id="f-args" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="--verbose" aria-describedby="launch-preview">
           <p class="hint" id="launch-preview"></p>
+          <p class="hint" id="launch-session-hint" hidden>É o padrão de toda abertura: no menu do <code>hub</code>, Enter abre direto com ele. Aperte <kbd>→</kbd> na conta para mudar só uma vez, ou <kbd>s</kbd> ali para salvar como novo padrão.</p>
+          <p class="hint" id="launch-history-hint" hidden></p>
         </div>
         <details class="adv" id="advanced">
           <summary><svg class="i"><use href="#i-chev"/></svg>Mais opções</summary>
@@ -1380,24 +1382,9 @@ const TYPES = {
   bedrock: { title: 'AWS Bedrock', id: 'claude-aws', label: 'Claude via AWS', short: 'Bedrock', hint: 'Chave de acesso AWS', logo: 'logo-bedrock', color: 'var(--c-bedrock)', command: 'claude', desc: 'Modelos cobrados na sua conta AWS. Por enquanto: Claude.' },
   custom:  { title: 'Outra CLI',   hint: 'Qualquer comando',    logo: 'i-terminal',   color: 'var(--c-custom)',  command: '',       desc: 'Qualquer ferramenta de terminal.' },
 };
-// Opções de abertura por executável: marcar uma delas escreve o argumento no campo "Argumentos" da conta.
+// Opções de abertura por executável (vêm do servidor: o menu do terminal usa as mesmas).
+// Marcar uma delas escreve o argumento no campo "Argumentos" da conta e vira o padrão de toda abertura.
 // risk = dispensa as confirmações da ferramenta (fica em destaque no formulário e no card).
-const LAUNCH_OPTS = {
-  claude: [
-    { flag: '--dangerously-skip-permissions', title: 'Liberar todas as permissões', desc: 'Não pede confirmação para editar arquivos nem rodar comandos.', risk: true },
-    { flag: '--permission-mode acceptEdits', title: 'Aceitar edições de arquivo', desc: 'Edita sem perguntar; comandos continuam pedindo confirmação.' },
-    { flag: '--continue', title: 'Continuar a última conversa', desc: 'Retoma a conversa mais recente da pasta em que você abrir.' },
-  ],
-  codex: [
-    { flag: '--dangerously-bypass-approvals-and-sandbox', title: 'Liberar todas as permissões', desc: 'Sem aprovações e sem sandbox.', risk: true },
-    { flag: '--search', title: 'Busca na web', desc: 'Deixa o Codex pesquisar na internet.' },
-  ],
-  gemini: [{ flag: '--yolo', title: 'Liberar todas as permissões', desc: 'Aprova todas as ações sem perguntar.', risk: true }],
-  copilot: [
-    { flag: '--allow-all-tools', title: 'Liberar todas as ferramentas', desc: 'Usa qualquer ferramenta sem pedir confirmação.', risk: true },
-    { flag: '--continue', title: 'Continuar a última conversa', desc: 'Retoma a sessão mais recente.' },
-  ],
-};
 const argTokens = (s) => String(s || '').trim().split(/\s+/).filter(Boolean);
 // Posição de uma opção (um ou mais tokens seguidos) dentro dos argumentos; -1 se não está.
 function argIndex(tokens, flag) {
@@ -1413,13 +1400,27 @@ function setArg(args, flag, on) {
   if (!on && i >= 0) tokens.splice(i, argTokens(flag).length);
   return tokens.join(' ');
 }
-const launchOptsOf = (command) => LAUNCH_OPTS[command] || [];
+const launchOptsOf = (command) => ((state && state.launchOpts) || {})[command] || [];
+// Subcomandos (lead) vão para a frente, como o hub faz ao abrir: "codex resume --last --search".
+function orderArgs(command, args) {
+  let rest = argTokens(args).join(' ');
+  const lead = [];
+  for (const o of launchOptsOf(command)) if (o.lead && hasArg(rest, o.flag)) { rest = setArg(rest, o.flag, false); lead.push(...argTokens(o.flag)); }
+  return [...lead, ...argTokens(rest)].join(' ');
+}
+// Opções do mesmo grupo digitadas juntas (ex.: liberar tudo × aceitar só edições); null se não houver.
+function argConflict(command, args) {
+  const on = launchOptsOf(command).filter((o) => o.group && hasArg(args, o.flag));
+  for (const o of on) { const x = on.find((y) => y !== o && y.group === o.group); if (x) return [o, x]; }
+  return null;
+}
 const riskyArgs = (a) => launchOptsOf(a.command).some((o) => o.risk && hasArg(a.args, o.flag));
 // Os quadros de marcar e o campo de texto mostram a mesma coisa: quem muda um atualiza o outro.
 function renderLaunch() {
   const command = $('#f-command').value.trim();
   const opts = launchOptsOf(command);
   $('#launch-opts').hidden = !opts.length;
+  $('#launch-session-hint').hidden = !opts.length;
   $('#launch-args-label').textContent = opts.length ? 'Outros argumentos (as opções acima aparecem aqui)' : 'Argumentos';
   $('#launch-opts').innerHTML = opts.map((o, i) => `<label class="check${o.risk ? ' risk' : ''}">
     <input type="checkbox" name="launch-opt" value="${i}">
@@ -1432,7 +1433,13 @@ function syncLaunch() {
   const args = $('#f-args').value;
   $$('input[name=launch-opt]').forEach((el) => { el.checked = hasArg(args, opts[Number(el.value)].flag); });
   $('#launch-risk').hidden = !opts.some((o) => o.risk && hasArg(args, o.flag));
-  const full = [command, ...argTokens(args)].join(' ');
+  const full = [command, ...argTokens(orderArgs(command, args))].join(' ');
+  // histórico de sessões: cada CLI abre de um jeito (ou não abre por argumento)
+  const hist = ((state && state.launchHistory) || {})[command];
+  $('#launch-history-hint').hidden = !hist;
+  $('#launch-history-hint').innerHTML = hist === true
+    ? 'Para retomar uma conversa antiga: no menu do <code>hub</code>, aperte <kbd>→</kbd> na conta e <kbd>→</kbd> de novo. Abre o histórico de sessões da pasta em que você abriu o hub.'
+    : hist ? `Histórico de sessões: ${esc(hist)}.` : '';
   $('#launch-preview').innerHTML = command ? `O hub abre com <code>${esc(full)}</code>` : '';
 }
 
@@ -2733,6 +2740,9 @@ function collectAccount() {
   if (!command) errors.push(fieldError($('#f-exec') || $('#f-command'), 'Informe o comando que abre a ferramenta.'));
   else if (!/^[A-Za-z0-9._~/\\:-]+$/.test(command)) errors.push(fieldError($('#f-exec') || $('#f-command'), 'Só o nome do programa (ex.: aider). Argumentos vão em "Ao abrir → Argumentos".'));
 
+  const clash = argConflict(command, $('#f-args').value);
+  if (clash) errors.push(fieldError($('#f-args'), `"${clash[0].title}" e "${clash[1].title}" não podem ficar juntas (${clash[0].flag} × ${clash[1].flag}). Deixe só uma.`));
+
   if (errors.some((el) => el.closest('#advanced'))) $('#advanced').open = true;
   if (errors.length) {
     $('#acc-error').textContent = errors.length === 1 ? 'Corrija o campo destacado.' : `Corrija os ${errors.length} campos destacados.`;
@@ -2754,7 +2764,7 @@ function renderReview({ account: a, newProfile }) {
     if (a.env.ANTHROPIC_MODEL) rows.push(['ID do modelo', `<code>${esc(a.env.ANTHROPIC_MODEL)}</code>`]);
   }
   if (a.type === 'custom') rows.push(['Executável', `<code>${esc(a.command)}</code>`]);
-  if (a.args) rows.push(['Ao abrir', `<code>${esc(`${a.command} ${a.args}`)}</code>${riskyArgs(a) ? ' <span class="tag warn">permissões liberadas</span>' : ''}`]);
+  if (a.args) rows.push(['Ao abrir', `<code>${esc(`${a.command} ${orderArgs(a.command, a.args)}`)}</code>${riskyArgs(a) ? ' <span class="tag warn">permissões liberadas</span>' : ''}`]);
   const installed = Boolean(state.installed[a.command]);
   const next = [];
   if (!installed) next.push(`A ferramenta <code>${esc(a.command)}</code> ainda não está instalada. Depois de salvar, use o botão <b>Instalar</b> no card (ou <code>/install</code> no terminal).`);
@@ -3739,7 +3749,12 @@ $('#f-command').addEventListener('input', renderLaunch);
 $('#launch-opts').addEventListener('change', (e) => {
   const opt = launchOptsOf($('#f-command').value.trim())[Number(e.target.value)];
   if (!opt) return;
-  $('#f-args').value = setArg($('#f-args').value, opt.flag, e.target.checked);
+  let args = $('#f-args').value;
+  // opções do mesmo grupo se excluem (ex.: liberar tudo × aceitar só edições)
+  if (e.target.checked && opt.group) {
+    for (const o of launchOptsOf($('#f-command').value.trim())) if (o !== opt && o.group === opt.group) args = setArg(args, o.flag, false);
+  }
+  $('#f-args').value = setArg(args, opt.flag, e.target.checked);
   syncLaunch();
 });
 $('#f-name').addEventListener('input', (e) => {

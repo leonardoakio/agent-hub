@@ -929,7 +929,7 @@ async function firstRunDetect() {
   FLASH = 'Contas adicionadas! Escolha uma para abrir.';
 }
 
-async function launch(name, extra = []) {
+async function launch(name, extra = [], argsOverride = null) {
   const a = byName.get(name);
   if (!a) { warnErr(`conta desconhecida: ${name}`); return 1; }
   const cmd = a.command;
@@ -965,12 +965,17 @@ async function launch(name, extra = []) {
       cursor('cnorm');
       if ((await runCli(cmd, lc, env)) !== 0) echo(`${YEL}!${N} o login não foi concluído: abrindo mesmo assim`);
     }
-    const args = splitWords(a.args).map(lib.expandHome);
+    const clash = lib.argConflict(cmd, argsOverride ?? a.args);
+    if (clash) {
+      warnErr(`${clash[0].flag} e ${clash[1].flag} não podem ser usados juntos: deixe só um nos argumentos de ${a.label}`);
+      return 1;
+    }
+    const args = splitWords(lib.orderArgs(cmd, argsOverride ?? a.args)).map(lib.expandHome);
     try {
       fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
       fs.writeFileSync(STATE_FILE, `${name}\n`);
     } catch {}
-    echo(`${TEAL}→${N} ${B}${a.label}${N}`);
+    echo(`${TEAL}→${N} ${B}${a.label}${N}${args.length ? `  ${GRAY}${args.join(' ')}${N}` : ''}`);
     cursor('cnorm');
     return await runCli(cmd, [...args, ...extra], env);
   } finally {
@@ -1156,6 +1161,131 @@ async function checkUpdate() {
   }
 }
 
+// ---------- Opções de abertura (só para esta vez) ----------
+// O padrão fica nos argumentos da conta (marcado na /ui); aqui dá para ligar/desligar sem mudar o config.
+const launchOpts = (a) => lib.launchOptsOf(a.command);
+const defaultOpts = (a) => launchOpts(a).filter((o) => lib.hasArg(a.args, o.flag));
+// Discreto de propósito: só lembra o padrão, sem disputar atenção com o status da conta.
+const optTags = (a) => { const t = defaultOpts(a).map((o) => (o.risk ? `◆ ${o.short}` : o.short)).join(' · '); return t ? `${GRAY}${t}${N}` : ''; };
+
+// Grava os argumentos como padrão da conta no config (o mesmo que salvar o formulário da /ui).
+function saveDefaultArgs(a, args) {
+  const accs = lib.readAccounts();
+  const acc = accs.find((x) => x.name === a.name);
+  if (!acc) throw new Error(`conta ${a.name} não está no config`);
+  acc.args = args;
+  lib.writeAccounts(accs);
+  a.args = args;
+}
+
+// Lê as sessões que a CLI lista para a pasta atual: linhas "  N. título (quando) [id]".
+function parseSessions(text) {
+  const list = [];
+  for (const line of String(text || '').split('\n')) {
+    const m = /^\s*(\d+)\.\s+(.*?)\s*(?:\(([^()]*)\))?\s*(?:\[[^\]]*\])?\s*$/.exec(line);
+    if (m) list.push({ n: m[1], title: m[2] || '(sem título)', when: m[3] || '' });
+  }
+  return list;
+}
+
+// Histórico de sessões da pasta atual para CLIs que só listam (ex.: gemini --list-sessions).
+// Devolve { n } com o número da sessão, { error } ou null (Esc: volta sem escolher).
+async function sessionPicker(a, resume) {
+  paint(`\n  ${GRAY}lendo o histórico de sessões de ${a.label}…${N}`);
+  const r = await lib.run(a.command, resume.list, 60000, accountEnv(a));
+  const list = parseSessions(r.stdout).reverse(); // mais recente primeiro
+  if (!list.length) return { error: r.ok ? `nenhuma sessão de ${a.label} nesta pasta ainda` : `não consegui ler o histórico: ${(r.stderr || r.stdout).split('\n')[0].slice(0, 120) || 'a CLI falhou'}` };
+  let sel = 0;
+  for (;;) {
+    const max = Math.max(3, (termRows() || 24) - 9);
+    const top = Math.min(Math.max(0, sel - max + 1), Math.max(0, list.length - max));
+    let o = `\n  ${GRAY}${B}HISTÓRICO${N}  ${B}${a.label}${N} ${GRAY}em ${lib.homeRel(process.cwd())} · ${list.length} sessão(ões)${N}\n\n`;
+    list.slice(top, top + max).forEach((x, j) => {
+      const i = top + j;
+      const title = x.title.length > 70 ? `${x.title.slice(0, 69)}…` : x.title;
+      o += `  ${i === sel ? `${GREEN}${B}❯${N}` : ' '} ${i === sel ? B : ''}${title}${N}  ${GRAY}${x.when}${N}\n`;
+    });
+    if (list.length > max) o += `  ${GRAY}… ${sel + 1} de ${list.length}${N}\n`;
+    o += `\n  ${TEAL}↑ ↓  ${N}  ${GRAY}escolhe a sessão${N}\n  ${TEAL}Enter${N}  ${GRAY}retoma a sessão escolhida${N}\n  ${TEAL}← Esc${N} ${GRAY}volta às opções${N}`;
+    paint(o);
+    const k = await readKey();
+    if (k === null || k === '\x1b' || k === '\x1b[D') return null;
+    if (k === '\x1b[A' || k === 'k') { if (sel > 0) sel--; }
+    else if (k === '\x1b[B' || k === 'j') { if (sel < list.length - 1) sel++; }
+    else if (k === '' || k === '\x1b[C') return { n: list[sel].n };
+  }
+}
+
+// Devolve { args, extra } com o escolhido ou null (Esc: volta ao menu sem abrir).
+// → abre o histórico de sessões da pasta atual (o --resume da CLI) com as opções marcadas.
+async function launchPicker(a) {
+  const opts = launchOpts(a);
+  const resume = lib.resumeOf(a.command);
+  let args = a.args || '';
+  let sel = 0;
+  let note = '';
+  const toggle = (i) => {
+    const o = opts[i];
+    const on = !lib.hasArg(args, o.flag);
+    if (on && o.group) for (const x of opts) if (x !== o && x.group === o.group) args = lib.setArg(args, x.flag, false);
+    args = lib.setArg(args, o.flag, on);
+  };
+  cursor('civis');
+  for (;;) {
+    let o = `\n  ${GRAY}${B}ABRIR${N}  ${B}${a.label}${N} ${GRAY}(${a.name})${N}\n\n`;
+    opts.forEach((x, i) => {
+      const on = lib.hasArg(args, x.flag);
+      const box = on ? `${x.risk ? YEL : GREEN}${B}[x]${N}` : `${GRAY}[ ]${N}`;
+      const ptr = i === sel ? `${GREEN}${B}❯${N}` : ' ';
+      o += `  ${ptr} ${TEAL}${i + 1}${N} ${box} ${i === sel ? B : ''}${x.title}${N}  ${GRAY}${x.flag}${N}\n`;
+      o += `          ${GRAY}${x.desc}${N}\n`;
+    });
+    const full = [a.command, ...splitWords(lib.orderArgs(a.command, args))].join(' ');
+    o += `\n  ${GRAY}abre com:${N} ${B}${full}${N}\n`;
+    if (opts.some((x) => x.risk && lib.hasArg(args, x.flag))) o += `  ${GRAY}◆ a ferramenta vai editar arquivos e rodar comandos sem pedir confirmação${N}\n`;
+    const changed = splitWords(args).join(' ') !== splitWords(a.args).join(' ');
+    const key = (k, d, hot = false) => `  ${hot ? `${TEAL}${B}` : TEAL}${k}${N}  ${GRAY}${d}${N}\n`;
+    o += '\n';
+    o += key('↑ ↓   ', 'anda pelas opções');
+    o += key('Espaço', 'marca ou desmarca a opção (o número dela também serve) · 0 desmarca tudo');
+    o += key('Enter ', 'abre com o que está marcado');
+    if (resume) o += key('→     ', resume.note ? `histórico de sessões: ${resume.note}` : `histórico de sessões de ${lib.homeRel(process.cwd())}: escolha uma conversa antiga para retomar`);
+    o += key('s     ', 'salva o que está marcado como padrão da conta', changed);
+    o += key('← Esc ', 'volta ao menu sem abrir');
+    o += note ? `\n  ${note}` : changed
+      ? `\n  ${GRAY}sem salvar, vale só para esta vez: o padrão da conta continua o mesmo${N}`
+      : `\n  ${GRAY}igual ao padrão da conta${N}`;
+    note = '';
+    paint(o);
+    const k = await readKey();
+    if (k === null || k === '\x1b' || k === '\x1b[D') return null;
+    if (k === '\x1b[A' || k === 'k') { if (sel > 0) sel--; }
+    else if (k === '\x1b[B' || k === 'j') { if (sel < opts.length - 1) sel++; }
+    else if (k === ' ' || k === 'x') toggle(sel);
+    else if (k === '0') { for (const x of opts) args = lib.setArg(args, x.flag, false); }
+    else if (k === 's' || k === 'S') {
+      try { saveDefaultArgs(a, args); note = `${MINT}✓ salvo como padrão de ${a.label}${N}`; }
+      catch (e) { note = `${YEL}! não consegui salvar: ${e.message}${N}`; }
+    }
+    else if (/^[1-9]$/.test(k) && Number(k) <= opts.length) { sel = Number(k) - 1; toggle(sel); }
+    else if (k === '') return { args, extra: [] };
+    else if ((k === '\x1b[C' || k === 'l') && resume) {
+      if (resume.note) { note = `${YEL}!${N} ${GRAY}${resume.note}${N}`; continue; }
+      let r = args;
+      for (const f of resume.drop) r = lib.setArg(r, f, false);
+      if (resume.list) {
+        // a CLI só lista as sessões: o hub mostra a lista e abre a escolhida
+        const picked = await sessionPicker(a, resume);
+        if (picked === null) continue;
+        if (picked.error) { note = `${YEL}!${N} ${GRAY}${picked.error}${N}`; continue; }
+        return { args: r, extra: resume.pick(picked.n) };
+      }
+      // subcomando (lead) vai antes das outras opções; flag comum vai depois
+      return resume.lead ? { args: [...resume.args, ...splitWords(r)].join(' '), extra: [] } : { args: r, extra: resume.args };
+    }
+  }
+}
+
 let FACE = '', MSG1 = '', MSG2 = '';
 function mood() {
   const cmds = missing([]).map((a) => a.command);
@@ -1259,7 +1389,8 @@ function renderRaw(interactive, cmdMode, cmdBuf) {
       const status = !installed(a) ? `${YEL}○ não instalado${N}`
         : st === 'blocked' ? `${YEL}⚠ login bloqueado${N}`
           : st === 'login' ? `${YEL}⚠ ${a.type === 'bedrock' ? 'credenciais AWS' : 'fazer login'}${N}` : `${GREEN}● pronto${N}`;
-      o += `  ${ptr} ${TEAL}${i + 1}${N}  ${selOn}${pad(a.name, nw + 1)}${N} ${pad(a.label, 30)} ${status}\n`;
+      const tags = optTags(a);
+      o += `  ${ptr} ${TEAL}${i + 1}${N}  ${selOn}${pad(a.name, nw + 1)}${N} ${pad(a.label, 30)} ${status}${tags ? `  ${tags}` : ''}\n`;
     } else {
       if (item === 'act:ui') o += `\n  ${GRAY}${B}AÇÕES${N}\n`;
       const act = item.slice(4);
@@ -1273,14 +1404,19 @@ function renderRaw(interactive, cmdMode, cmdBuf) {
   hints += `  ${GRAY}# /skills   lista as skills de cada conta e instala novas a partir do GitHub${N}\n`;
   // as dicas são o primeiro corte quando o terminal é baixo (ex.: painel da IDE)
   const rows = interactive ? termRows() : 0;
-  if (!rows || o.split('\n').length + 10 <= rows) o += '\n' + hints;
+  if (!rows || o.split("\n").length + 12 <= rows) o += '\n' + hints;
   o += '\n';
   if (interactive && cmdMode) {
     const sug = suggestCmd(cmdBuf);
     o += `  ${GREEN}${B}›${N} ${B}${cmdBuf}${N}${GRAY}${sug.slice(cmdBuf.length)}${GREEN}▏${N}\n`;
     o += `  ${GRAY}Enter executa · Tab completa · Esc cancela${N}\n`;
   } else if (interactive) {
-    o += `  ${GRAY}escolha com as setas ↑ ↓ e aperte Enter · ou digite o número da conta · ou / para comandos${N}\n`;
+    // legenda das teclas: deixa claro que dá para navegar com as setas e ajustar antes de abrir
+    const key = (k, d) => `  ${TEAL}${k}${N}  ${GRAY}${d}${N}\n`;
+    o += key('↑ ↓  ', 'escolhe a conta (ou digite o número dela)');
+    o += key('Enter', 'abre a conta com o padrão dela');
+    o += key('→    ', 'ajusta antes de abrir: permissões, continuar a última conversa, histórico de sessões desta pasta');
+    o += key('/    ', 'comandos do hub');
     o += `\n  ${GRAY}sistema: ${lib.systemInfo().label}${N}\n`;
   } else {
     o += `  ${GRAY}digite um comando (/ui, /verify, /install, /update, /skills, /quit) ou o número da conta${N}\n`;
@@ -1295,13 +1431,24 @@ function render(interactive, cmdMode = false, cmdBuf = '') {
   else out(o);
 }
 
-async function runItem(item) {
+// pick: abre a tela de opções antes (→ no menu). Sem pick, abre direto com o padrão da conta.
+async function runItem(item, pick = false) {
+  let argsOverride = null;
+  let extra = [];
+  if (item.startsWith('acc:') && TTY_IN && TTY_OUT) {
+    const a = byName.get(item.slice(4));
+    if (pick && launchOpts(a).length) {
+      const picked = await launchPicker(a);
+      if (picked === null) return true;
+      ({ args: argsOverride, extra } = picked);
+    }
+  }
   cursor('cnorm');
   clearScreen();
   if (item.startsWith('acc:')) {
     const name = item.slice(4);
     const a = byName.get(name);
-    if ((await launch(name)) === 0) FLASH = `De volta! Você saiu de ${a.label}.`;
+    if ((await launch(name, extra, argsOverride)) === 0) FLASH = `De volta! Você saiu de ${a.label}.`;
     else await pause();
     await refreshLogin(a);
   } else {
@@ -1380,6 +1527,11 @@ async function interactiveMenu() {
     if (k === '\x1b[A' || k === 'k') { if (SEL > 0) SEL--; }
     else if (k === '\x1b[B' || k === 'j') { if (SEL < ITEMS.length - 1) SEL++; }
     else if (k === '') { if (!(await runItem(ITEMS[SEL]))) break; }
+    else if ((k === '\x1b[C' || k === 'l' || k === ' ') && ITEMS[SEL].startsWith('acc:')) {
+      const a = byName.get(ITEMS[SEL].slice(4));
+      if (launchOpts(a).length) { if (!(await runItem(ITEMS[SEL], true))) break; }
+      else FLASH = `${a.label} não tem opções de abertura: use os argumentos em /ui`;
+    }
     else if (/^[1-9]$/.test(k)) {
       let p = k;
       if (ACC.length > 9) { const more = await readCharWithin(600); if (more && /^[0-9]$/.test(more)) p += more; }

@@ -91,6 +91,25 @@ Também dá para ir direto: `hub claude-aws`. Argumentos extras vão para a CLI:
 
 Para abrir sempre com os mesmos argumentos, edite a conta na interface e use o bloco **Ao abrir**: marque uma opção (ex.: **Liberar todas as permissões**, que no Claude vira `--dangerously-skip-permissions`) ou digite os argumentos. O card da conta mostra o aviso "permissões liberadas" quando uma dessas opções está ligada.
 
+Cada CLI tem o seu argumento para a mesma função, e o hub mostra só os que valem para ela:
+
+| Função | Claude Code | Codex | Gemini CLI | Antigravity | Copilot CLI |
+|---|---|---|---|---|---|
+| Liberar todas as permissões | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--yolo` | `--dangerously-skip-permissions` | `--allow-all` |
+| Aceitar edições | `--permission-mode acceptEdits` | `--sandbox workspace-write --ask-for-approval on-request` | `--approval-mode auto_edit` | `--mode accept-edits` | `--allow-tool=write` |
+| Continuar a última conversa | `--continue` | `resume --last` | `--resume latest` | `--continue` | `--continue` |
+| Histórico de sessões (**→ →**) | `--resume` | `resume` | lista do hub, depois `--resume N` | só por `/resume` dentro dele | `--resume` |
+
+As duas opções de permissão não podem ser usadas juntas: o hub desmarca uma ao marcar a outra e recusa salvar ou abrir com as duas.
+
+Essas opções são o **padrão** da conta, mas dá para mudar só numa abertura, direto no menu do `hub`:
+
+- Enter (ou o número) abre direto com o padrão da conta, sem perguntar nada.
+- Para mudar só naquela vez, aperte **→** na conta: o hub mostra a tela **Abrir** com o padrão já marcado. Desmarque ou marque o que quiser (ex.: não liberar tudo numa pasta que você não conhece) e aperte Enter.
+- Para retomar uma conversa antiga, aperte **→** na conta e **→** de novo: abre o histórico de sessões da pasta em que você abriu o hub, já com as opções marcadas.
+- Na tela **Abrir**: ↑ ↓ escolhe, Espaço ou o número marca/desmarca, `0` desmarca tudo, Enter abre, → abre o histórico de sessões e ← ou Esc volta. A legenda das teclas fica sempre na tela. "Liberar todas as permissões" e "Aceitar edições de arquivo" se excluem. O que você muda ali vale só para aquela abertura, a menos que aperte **s**: aí vira o novo padrão da conta (grava no config, igual a salvar pela interface).
+- No menu, a linha da conta mostra o padrão em cinza, discreto (ex.: `◆ tudo liberado · continua`).
+
 ## Comandos do menu
 
 | Comando | O que faz |

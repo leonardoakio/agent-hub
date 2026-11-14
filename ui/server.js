@@ -123,6 +123,86 @@ const INDEX = path.join(__dirname, 'index.html');
 const FIELDS = ['type', 'label', 'command', 'args', 'install'];
 const API_VERSION = 1;
 const TYPES = ['claude', 'bedrock', 'codex', 'gemini', 'antigravity', 'copilot', 'custom'];
+
+// Opções de abertura por executável. A conta guarda as marcadas em "args" (padrão de toda abertura);
+// a interface mostra como caixas de marcar e o menu do terminal deixa ligar/desligar só para uma sessão.
+// risk = dispensa as confirmações da ferramenta; group = no máximo uma marcada por grupo.
+const LAUNCH_OPTS = {
+  claude: [
+    { flag: '--dangerously-skip-permissions', title: 'Liberar todas as permissões', short: 'tudo liberado', desc: 'Não pede confirmação para editar arquivos nem rodar comandos.', risk: true, group: 'perm' },
+    { flag: '--permission-mode acceptEdits', title: 'Aceitar edições de arquivo', short: 'aceita edições', desc: 'Edita sem perguntar; comandos continuam pedindo confirmação.', group: 'perm' },
+    { flag: '--continue', title: 'Continuar a última conversa', short: 'continua', desc: 'Retoma a conversa mais recente da pasta em que você abrir.' },
+  ],
+  codex: [
+    { flag: '--dangerously-bypass-approvals-and-sandbox', title: 'Liberar todas as permissões', short: 'tudo liberado', desc: 'Sem aprovações e sem sandbox.', risk: true, group: 'perm' },
+    { flag: '--sandbox workspace-write --ask-for-approval on-request', title: 'Aceitar edições na pasta do projeto', short: 'aceita edições', desc: 'Edita e roda comandos dentro da pasta do projeto sem perguntar; pede confirmação para sair dela.', group: 'perm' },
+    // subcomando: precisa vir antes das outras opções (lead)
+    { flag: 'resume --last', title: 'Continuar a última conversa', short: 'continua', desc: 'Retoma a sessão mais recente da pasta em que você abrir.', lead: true },
+    { flag: '--search', title: 'Busca na web', short: 'busca na web', desc: 'Deixa o Codex pesquisar na internet.' },
+  ],
+  gemini: [
+    { flag: '--yolo', title: 'Liberar todas as permissões', short: 'tudo liberado', desc: 'Aprova todas as ações sem perguntar.', risk: true, group: 'perm' },
+    { flag: '--approval-mode auto_edit', title: 'Aceitar edições de arquivo', short: 'aceita edições', desc: 'Edita sem perguntar; comandos continuam pedindo confirmação.', group: 'perm' },
+    { flag: '--resume latest', title: 'Continuar a última conversa', short: 'continua', desc: 'Retoma a sessão mais recente da pasta em que você abrir.' },
+  ],
+  agy: [
+    { flag: '--dangerously-skip-permissions', title: 'Liberar todas as permissões', short: 'tudo liberado', desc: 'Aprova todas as ações sem perguntar.', risk: true, group: 'perm' },
+    { flag: '--mode accept-edits', title: 'Aceitar edições de arquivo', short: 'aceita edições', desc: 'Edita sem perguntar; comandos continuam pedindo confirmação.', group: 'perm' },
+    { flag: '--continue', title: 'Continuar a última conversa', short: 'continua', desc: 'Retoma a conversa mais recente.' },
+  ],
+  copilot: [
+    { flag: '--allow-all', title: 'Liberar todas as permissões', short: 'tudo liberado', desc: 'Libera ferramentas, pastas e URLs sem pedir confirmação.', risk: true, group: 'perm' },
+    { flag: '--allow-all-tools', title: 'Liberar todas as ferramentas', short: 'ferramentas liberadas', desc: 'Usa qualquer ferramenta sem pedir confirmação; pastas e URLs continuam conferidas.', risk: true, group: 'perm' },
+    { flag: '--allow-tool=write', title: 'Aceitar edições de arquivo', short: 'aceita edições', desc: 'Edita sem perguntar; comandos continuam pedindo confirmação.', group: 'perm' },
+    { flag: '--continue', title: 'Continuar a última conversa', short: 'continua', desc: 'Retoma a sessão mais recente da pasta em que você abrir.' },
+  ],
+};
+// Como cada CLI abre o histórico de sessões da pasta atual (o hub roda a CLI na pasta em que foi aberto).
+//   args  = a própria CLI mostra a lista (lead: é subcomando, vai antes das outras opções)
+//   list  = a CLI só lista e sai: o hub mostra a lista e abre a escolhida com pick(número)
+//   note  = não há como abrir o histórico por argumento: o hub só explica o caminho
+//   drop  = opções que não combinam com escolher uma sessão (a de "continuar a última")
+const RESUME = {
+  claude: { args: ['--resume'], drop: ['--continue'] },
+  copilot: { args: ['--resume'], drop: ['--continue'] },
+  codex: { args: ['resume'], lead: true, drop: ['resume --last'] },
+  gemini: { list: ['--list-sessions'], pick: (n) => ['--resume', String(n)], drop: ['--resume latest'] },
+  agy: { note: 'o Antigravity não abre o histórico por argumento: abra a conta e digite /resume lá dentro', drop: [] },
+};
+const cliKey = (command) => path.basename(String(command || '')).replace(/\.(exe|cmd|bat)$/i, '');
+const resumeOf = (command) => RESUME[cliKey(command)] || null;
+// Para a interface: true = o hub abre o histórico com → →; texto = explicação de por que não abre.
+const launchHistory = () => Object.fromEntries(Object.entries(RESUME).map(([k, r]) => [k, r.note || true]));
+const launchOptsOf = (command) => LAUNCH_OPTS[cliKey(command)] || [];
+const argTokens = (s) => String(s || '').trim().split(/\s+/).filter(Boolean);
+// Posição de uma opção (um ou mais tokens seguidos) dentro dos argumentos; -1 se não está.
+function argIndex(tokens, flag) {
+  const f = argTokens(flag);
+  for (let i = 0; i + f.length <= tokens.length; i++) if (f.every((t, k) => tokens[i + k] === t)) return i;
+  return -1;
+}
+const hasArg = (args, flag) => argIndex(argTokens(args), flag) >= 0;
+function setArg(args, flag, on) {
+  const tokens = argTokens(args);
+  const i = argIndex(tokens, flag);
+  if (on && i < 0) tokens.push(...argTokens(flag));
+  if (!on && i >= 0) tokens.splice(i, argTokens(flag).length);
+  return tokens.join(' ');
+}
+// Opções do mesmo grupo que aparecem juntas nos argumentos (ex.: liberar tudo × aceitar só edições).
+// Devolve a primeira dupla em conflito ou null.
+function argConflict(command, args) {
+  const on = launchOptsOf(command).filter((o) => o.group && hasArg(args, o.flag));
+  for (const o of on) { const x = on.find((y) => y !== o && y.group === o.group); if (x) return [o, x]; }
+  return null;
+}
+// Subcomandos (lead) vão para a frente: "codex --search resume --last" vira "codex resume --last --search".
+function orderArgs(command, args) {
+  let rest = argTokens(args).join(' ');
+  const lead = [];
+  for (const o of launchOptsOf(command)) if (o.lead && hasArg(rest, o.flag)) { rest = setArg(rest, o.flag, false); lead.push(...argTokens(o.flag)); }
+  return [...lead, ...argTokens(rest)].join(' ');
+}
 // Meios pelos quais cada CLI pode ter sido instalada. O hub descobre qual foi usado olhando onde o
 // executável está e atualiza pelo mesmo meio, em vez de assumir npm para tudo.
 // TLS 1.2 explícito: o PowerShell 5.1 de Windows mais antigos ainda negocia TLS 1.0 e o download falha.
@@ -504,6 +584,8 @@ function validateAccounts(accounts) {
     if (!/^[A-Za-z0-9._~/\\:-]+$/.test(command)) throw new Error(`${name}: comando inválido`);
     const args = String(a.args || '').trim();
     if (/[\r\n]/.test(args)) throw new Error(`${name}: argumentos não podem ter quebra de linha`);
+    const clash = argConflict(command, args);
+    if (clash) throw new Error(`${name}: ${clash[0].flag} e ${clash[1].flag} não podem ser usados juntos; escolha um`);
     const install = String(a.install || '').trim();
     if (/[\r\n]/.test(install)) throw new Error(`${name}: comando de instalação não pode ter quebra de linha`);
     const env = {};
@@ -3309,6 +3391,8 @@ async function state() {
     agentModels: syncedState(SYNCED.models),
     instructions: instructionsState(),
     skillCatalog: catalogState(),
+    launchOpts: LAUNCH_OPTS,
+    launchHistory: launchHistory(),
     installed: inst,
     versions: await versions(inst),
   };
@@ -3708,7 +3792,7 @@ function start(port, attempt = 0) {
 if (require.main !== module) {
   // usado pelo terminal: mesma lógica, sem abrir o servidor
   module.exports = {
-    HOME, CONFIG, IS_WIN, IS_MAC, IS_WSL, systemInfo, systemDetails, repoInfo, TYPES, DEFAULT_INSTALL, SELF_UPDATING, NODE_MIN, installCmd,
+    HOME, CONFIG, IS_WIN, IS_MAC, IS_WSL, LAUNCH_OPTS, launchOptsOf, resumeOf, argTokens, hasArg, setArg, argConflict, orderArgs, systemInfo, systemDetails, repoInfo, TYPES, DEFAULT_INSTALL, SELF_UPDATING, NODE_MIN, installCmd,
     INSTALL_WAYS, METHOD_LABEL, PKG_METHODS, wayCmd, classifyInstall, installInfo, installInfoFrom, installInfos, resolveInstall, npmNeedsSudo, npmPrefix, SYS_PMS, sysPkgOf,
     run, runShell, shellArgs, npmCleanLeftovers, npmPkgsOf, performInstall, installPlan, refreshPath, nodeSatisfies, npmEngines, which, whichAll, python, pyRun, expandHome, homeRel, spawnArgs, winQuote, fullEnv, renameSafe, rmSafe,
     readAccounts, writeAccounts, validateAccounts, parseConfig, inferType, effectiveType, bedrockSource, claudeSettingsEnv, awsEnvOf,

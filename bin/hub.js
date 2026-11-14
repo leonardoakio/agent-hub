@@ -677,9 +677,11 @@ async function skillInstallDeps(folders, source = '') {
       else out(`    ${RED}✗${N} ${d.label}${why}\n`);
     }
   }
-  if (steps.length) {
+  const autoSteps = steps.filter((s) => s.kind === 'auto'), manualSteps = steps.filter((s) => s.kind !== 'auto');
+  for (const s of autoSteps) out(`    ${GREEN}·${N} ${folders.length > 1 ? `${s.skill}: ` : ''}${plain(s.title)} ${GRAY}(${plain(s.detail)})${N}\n`);
+  if (manualSteps.length) {
     out(`    ${B}Depois de instalar${N} ${GRAY}(o SKILL.md pede; o hub não faz sozinho)${N}\n`);
-    for (const s of steps) out(`    ${YEL}·${N} ${folders.length > 1 ? `${s.skill}: ` : ''}${plain(s.title)}${s.cmd ? ` ${GRAY}→ ${plain(s.cmd)}${N}` : ''}${s.detail ? ` ${GRAY}(${plain(s.detail)})${N}` : ''}\n`);
+    for (const s of manualSteps) out(`    ${YEL}·${N} ${folders.length > 1 ? `${s.skill}: ` : ''}${plain(s.title)}${s.cmd ? ` ${GRAY}→ ${plain(s.cmd)}${N}` : ''}${s.detail ? ` ${GRAY}(${plain(s.detail)})${N}` : ''}\n`);
   }
   if (!r.deps.length) return;
   const need = r.deps.filter((d) => !d.ok && !d.optional);
@@ -693,6 +695,7 @@ async function skillInstallDeps(folders, source = '') {
   }
   const viaLib = need.some((d) => ['pip', 'npm', 'brew'].includes(d.how));
   const sysArgs = Array.isArray(r.sysArgs) ? r.sysArgs : [];
+  const sysRuns = Array.isArray(r.sysRuns) && r.sysRuns.length ? r.sysRuns : sysArgs.length ? [sysArgs] : [];
   const npmArgs = Array.isArray(r.npmArgs) ? r.npmArgs : [];
   if (!sysArgs.length && !npmArgs.length && !viaLib) return;
   echo();
@@ -702,8 +705,12 @@ async function skillInstallDeps(folders, source = '') {
   }
   // programas do sistema: apt, dnf, zypper, pacman, apk (com sudo) ou winget (sem sudo); saída ao vivo para a senha
   if (sysArgs.length) {
-    out(`  ${TEAL}→${N} programas do sistema: ${B}${r.sysCommand}${N}\n`);
-    const code = r.sysSudo ? await runCli('sudo', sysArgs, process.env) : await runCli(sysArgs[0], sysArgs.slice(1), process.env);
+    let code = 0;
+    for (const argv of sysRuns) {
+      out(`  ${TEAL}→${N} programas do sistema: ${B}${r.sysSudo ? 'sudo ' : ''}${argv.join(' ')}${N}\n`);
+      const c = r.sysSudo ? await runCli('sudo', argv, process.env) : await runCli(argv[0], argv.slice(1), process.env);
+      if (c !== 0) code = c;
+    }
     if (code === 0) out(`  ${GREEN}✓${N} programas do sistema instalados\n`);
     else out(`  ${RED}✗${N} não consegui instalar os programas do sistema (código ${code})\n`);
     if (need.some((d) => d.how === 'needs-pip')) {
@@ -738,6 +745,7 @@ async function skillsMenu() {
   if (TTY_IN && TTY_OUT) {
     const items = rows.map((r) => [r.name, truncateDesc(r.desc, width - 12), `em: ${whereOf(r)}`]);
     items.push([`${GREEN}＋${N} Instalar uma skill nova`, 'cole um repositório do GitHub (ex.: cloudflare/security-audit-skill)']);
+    if (rows.length) items.push([`${TEAL}↻${N} Atualizar as skills instaladas`, 'confere no GitHub e baixa a versão nova das que mudaram']);
     const p = await pick(`SKILLS INSTALADAS · ${rows.length}`, 'escolha com ↑ ↓ e aperte Enter para abrir a CLI já usando a skill · ou o número · Esc volta', items);
     if (p < 0) { SKILL_DONE = 'back'; return 0; }
     if (p < rows.length) {
@@ -745,6 +753,7 @@ async function skillsMenu() {
       return skillRun(rows[p].name, accsOf(rows[p]));
     }
     cursor('cnorm');
+    if (p === rows.length + 1) { clearScreen(); echo(); const code = await skillsUpdate([]); SKILL_DONE = 'updated'; return code; }
     out('\n');
     src = ((await readLine('  Repositório do GitHub (Esc cancela): ')) || '').trim();
     if (!src) { SKILL_DONE = 'back'; return 0; }
@@ -767,6 +776,35 @@ async function skillsMenu() {
     }
   }
   return installSkillFrom(src, T);
+}
+
+// Confere no GitHub e atualiza as skills instaladas que têm origem conhecida (todas, ou só as pedidas).
+async function skillsUpdate(names = []) {
+  let check;
+  try { check = await spinRun('conferindo as skills no GitHub…', lib.skillsCheck({ fresh: true })); } catch (e) { echo(`${RED}✗${N} ${e.message}`); return 1; }
+  for (const e of check.errors || []) echo(`${YEL}!${N} ${e}`);
+  const all = Object.entries(check.skills || {}).filter(([k]) => !names.length || names.includes(k));
+  if (!all.length) { echo(`${YEL}!${N} nenhuma skill instalada tem origem conhecida no GitHub${names.length ? ` (pedidas: ${names.join(' ')})` : ''}`); return 0; }
+  // sem commit gravado (skills do npx skills) só dá para saber baixando: entram junto
+  const todo = all.filter(([, v]) => v.update || v.unknown || names.length).map(([k]) => k);
+  for (const [k, v] of all) if (!todo.includes(k)) echo(`${GREEN}✓${N} ${k} ${GRAY}já na versão mais recente (${v.latest})${N}`);
+  if (!todo.length) return 0;
+  try {
+    for (const folder of todo) {
+      let r;
+      try { r = await spinRun(`atualizando ${folder}…`, lib.updateSkill({ skill: folder })); } catch (e) { echo(`${RED}✗${N} ${folder}: ${e.message}`); continue; }
+      if (r.modified.length) {
+        echo(`${YEL}!${N} ${B}${folder}${N} foi editada nesta máquina (${r.modified.join(', ')}): atualizar apaga as suas mudanças`);
+        if (TTY_IN && (await ask('  Sobrescrever com a versão do GitHub?'))) {
+          try { r = await spinRun(`atualizando ${folder}…`, lib.updateSkill({ skill: folder, force: true })); } catch (e) { echo(`${RED}✗${N} ${folder}: ${e.message}`); continue; }
+        } else { echo(`  ${GRAY}mantida como está${N}`); if (!r.updated.length) continue; }
+      }
+      if (r.updated.length) echo(`${GREEN}✓${N} ${B}${folder}${N} atualizada para ${r.commit} (${r.date}) em ${r.updated.length} pasta(s)`);
+      else echo(`${GREEN}✓${N} ${folder} ${GRAY}já na versão mais recente (${r.commit})${N}`);
+      for (const l of r.local || []) echo(`  ${/falhou|não está instalado/.test(l) ? `${YEL}!` : `${GREEN}✓`}${N} ${l}`);
+    }
+  } finally { lib.dropSources(); }
+  return 0;
 }
 
 async function installSkillFrom(src, T) {
@@ -804,7 +842,8 @@ async function installSkillFrom(src, T) {
       }
     }
     echo(`  encontrada(s): ${B}${found.map((s) => plain(s.folder) + ' ').join('')}${N}`);
-    echo(`  versão:        ${fetched.commit} · ${fetched.date} ${GRAY}(a mais recente, baixada agora)${N}`);
+    echo(`  versão:        ${fetched.commit} · ${fetched.date} ${GRAY}(a mais recente${fetched.branch ? ` da branch ${fetched.branch}` : ''}, baixada agora)${N}`);
+    for (const sk of found) if (sk.also && sk.also.length) echo(`  ${YEL}!${N} ${plain(sk.folder)} vem de ${sk.path}; há outra pasta com o mesmo nome (${sk.also.join(', ')}): para instalar aquela, cole o link dela`);
     const licenses = [...new Set(found.map((s) => plain(String(s.license || '')).trim()).filter(Boolean))];
     if (licenses.length) echo(`  licença:       ${licenses.join(', ')} ${GRAY}(declarada no SKILL.md)${N}`);
     echo(`  instalar em:   ${T.map((t) => t.label).join(' · ')}`);
@@ -820,6 +859,7 @@ async function installSkillFrom(src, T) {
     try {
       const r = await lib.installSkills({ source: src, skills: ok, targets: T.map((t) => t.dir) });
       for (const f of r.installed) echo(`${GREEN}✓${N} ${B}${f}${N} instalada em ${r.targets.length} pasta(s): reabra a CLI para carregar`);
+      for (const l of r.local || []) echo(`  ${/falhou|não está instalado/.test(l) ? `${YEL}!` : `${GREEN}✓`}${N} ${l}`);
     } catch (e) {
       echo(`${RED}✗${N} ${e.message}`);
       return 1;
@@ -1218,12 +1258,13 @@ async function sessionPicker(a, resume) {
 
 // Devolve { args, extra } com o escolhido ou null (Esc: volta ao menu sem abrir).
 // → abre o histórico de sessões da pasta atual (o --resume da CLI) com as opções marcadas.
-async function launchPicker(a) {
+// start/startNote: reabre a tela como estava (ao voltar do histórico sem escolher uma sessão).
+async function launchPicker(a, start = null, startNote = '') {
   const opts = launchOpts(a);
   const resume = lib.resumeOf(a.command);
-  let args = a.args || '';
+  let args = start ?? (a.args || '');
   let sel = 0;
-  let note = '';
+  let note = startNote;
   const toggle = (i) => {
     const o = opts[i];
     const on = !lib.hasArg(args, o.flag);
@@ -1281,7 +1322,8 @@ async function launchPicker(a) {
         return { args: r, extra: resume.pick(picked.n) };
       }
       // subcomando (lead) vai antes das outras opções; flag comum vai depois
-      return resume.lead ? { args: [...resume.args, ...splitWords(r)].join(' '), extra: [] } : { args: r, extra: resume.args };
+      // history: a lista é da própria CLI; se sair dela sem abrir uma sessão, o hub volta para esta tela (back)
+      return resume.lead ? { args: [...resume.args, ...splitWords(r)].join(' '), extra: [], history: true, back: args } : { args: r, extra: resume.args, history: true, back: args };
     }
   }
 }
@@ -1433,25 +1475,39 @@ function render(interactive, cmdMode = false, cmdBuf = '') {
 
 // pick: abre a tela de opções antes (→ no menu). Sem pick, abre direto com o padrão da conta.
 async function runItem(item, pick = false) {
-  let argsOverride = null;
-  let extra = [];
-  if (item.startsWith('acc:') && TTY_IN && TTY_OUT) {
-    const a = byName.get(item.slice(4));
-    if (pick && launchOpts(a).length) {
-      const picked = await launchPicker(a);
-      if (picked === null) return true;
-      ({ args: argsOverride, extra } = picked);
-    }
-  }
-  cursor('cnorm');
-  clearScreen();
   if (item.startsWith('acc:')) {
     const name = item.slice(4);
     const a = byName.get(name);
-    if ((await launch(name, extra, argsOverride)) === 0) FLASH = `De volta! Você saiu de ${a.label}.`;
-    else await pause();
+    const canPick = pick && TTY_IN && TTY_OUT && launchOpts(a).length;
+    let start = null;
+    let startNote = '';
+    for (;;) {
+      let argsOverride = null;
+      let extra = [];
+      let picked = null;
+      if (canPick) {
+        picked = await launchPicker(a, start, startNote);
+        if (picked === null) return true;
+        ({ args: argsOverride, extra } = picked);
+      }
+      cursor('cnorm');
+      clearScreen();
+      const code = await launch(name, extra, argsOverride);
+      if (code === 0) { FLASH = `De volta! Você saiu de ${a.label}.`; break; }
+      // saiu do histórico da CLI sem abrir uma sessão (Esc): volta para a tela Abrir como estava
+      if (picked && picked.history) {
+        start = picked.back;
+        startNote = `${GRAY}voltou do histórico sem abrir uma sessão${N}`;
+        cursor('civis');
+        continue;
+      }
+      await pause();
+      break;
+    }
     await refreshLogin(a);
   } else {
+    cursor('cnorm');
+    clearScreen();
     switch (item.slice(4)) {
       case 'ui': {
         IGNORE_INT = true;
@@ -1577,7 +1633,7 @@ comandos no menu:
   /verify    verifica as CLIs instaladas
   /install   instala as CLIs cadastradas que faltam
   /update    atualiza as CLIs instaladas para a versão mais recente
-  /skills    lista e instala skills (SKILL.md) a partir do GitHub
+  /skills    lista e instala skills (SKILL.md) a partir do GitHub; hub skills update atualiza as instaladas
   /quit      sai
 
 config: ${CONFIG}
@@ -1599,7 +1655,7 @@ async function main(argv) {
     case 'ui': return openUi();
     case 'install': return installMissing(rest);
     case 'update': await updateInstalled(rest); await bedrockModelsUpdate(rest); return modelsUpdate(rest);
-    case 'skills': return skillsMenu();
+    case 'skills': return rest[0] === 'update' ? skillsUpdate(rest.slice(1)) : skillsMenu();
     case 'skill': {
       const [skill, accName] = rest;
       if (!skill) { warnErr('uso: hub skill <nome> [conta]'); return 2; }

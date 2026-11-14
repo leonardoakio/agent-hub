@@ -13,13 +13,13 @@
     {"type": "py", "name": "pdfplumber", "pip": "pdfplumber", "label": "Python: pdfplumber", "why": "extrair texto e tabelas"},
     {"type": "py", "name": "pdf2image", "pip": "pdf2image", "label": "Python: pdf2image", "why": "converter páginas em imagem", "apt": "python3-pdf2image"},
     {"type": "py", "name": "PIL", "pip": "pillow", "label": "Python: Pillow", "why": "imagens", "apt": "python3-pil", "pacman": "python-pillow", "dnf": "python3-pillow"},
-    {"type": "bin", "name": "pdftoppm", "apt": "poppler-utils", "label": "poppler-utils", "why": "renderizar páginas de PDF", "brew": "poppler", "pacman": "poppler", "winget": "oschwartz10612.Poppler", "manual": "https://poppler.freedesktop.org"},
+    {"type": "bin", "name": "pdftoppm", "apt": "poppler-utils", "zypper": "poppler-tools", "label": "poppler-utils", "why": "renderizar páginas de PDF", "brew": "poppler", "pacman": "poppler", "winget": "oschwartz10612.Poppler", "manual": "https://poppler.freedesktop.org"},
     {"type": "bin", "name": "qpdf", "apt": "qpdf", "label": "qpdf", "why": "manipular PDFs", "brew": "qpdf", "pacman": "qpdf", "winget": "QPDF.QPDF", "manual": "https://qpdf.readthedocs.io/en/stable/installation.html"}
   ],
   "docx": [
     {"type": "bin", "name": "soffice", "apt": "libreoffice", "label": "LibreOffice", "why": "converter e validar documentos", "brew": "libreoffice", "brewCask": true, "pacman": "libreoffice-fresh", "winget": "TheDocumentFoundation.LibreOffice", "manual": "https://www.libreoffice.org/download/"},
     {"type": "bin", "name": "pandoc", "apt": "pandoc", "label": "pandoc", "why": "converter texto e Word", "brew": "pandoc", "pacman": "pandoc-cli", "winget": "JohnMacFarlane.Pandoc", "manual": "https://pandoc.org/installing.html"},
-    {"type": "bin", "name": "pdftoppm", "apt": "poppler-utils", "label": "poppler-utils", "why": "pré-visualizar páginas", "brew": "poppler", "pacman": "poppler", "winget": "oschwartz10612.Poppler", "manual": "https://poppler.freedesktop.org"},
+    {"type": "bin", "name": "pdftoppm", "apt": "poppler-utils", "zypper": "poppler-tools", "label": "poppler-utils", "why": "pré-visualizar páginas", "brew": "poppler", "pacman": "poppler", "winget": "oschwartz10612.Poppler", "manual": "https://poppler.freedesktop.org"},
     {"type": "py", "name": "lxml", "pip": "lxml", "label": "Python: lxml", "why": "ler o XML do Office", "apt": "python3-lxml"},
     {"type": "py", "name": "defusedxml", "pip": "defusedxml", "label": "Python: defusedxml", "why": "ler XML com segurança", "apt": "python3-defusedxml"},
     {"type": "npm", "name": "docx", "npm": "docx", "label": "Node: docx", "why": "criar arquivos Word"}
@@ -32,7 +32,7 @@
   ],
   "pptx": [
     {"type": "bin", "name": "soffice", "apt": "libreoffice", "label": "LibreOffice", "why": "converter apresentações", "brew": "libreoffice", "brewCask": true, "pacman": "libreoffice-fresh", "winget": "TheDocumentFoundation.LibreOffice", "manual": "https://www.libreoffice.org/download/"},
-    {"type": "bin", "name": "pdftoppm", "apt": "poppler-utils", "label": "poppler-utils", "why": "miniaturas dos slides", "brew": "poppler", "pacman": "poppler", "winget": "oschwartz10612.Poppler", "manual": "https://poppler.freedesktop.org"},
+    {"type": "bin", "name": "pdftoppm", "apt": "poppler-utils", "zypper": "poppler-tools", "label": "poppler-utils", "why": "miniaturas dos slides", "brew": "poppler", "pacman": "poppler", "winget": "oschwartz10612.Poppler", "manual": "https://poppler.freedesktop.org"},
     {"type": "py", "name": "lxml", "pip": "lxml", "label": "Python: lxml", "why": "ler o XML do Office", "apt": "python3-lxml"},
     {"type": "py", "name": "defusedxml", "pip": "defusedxml", "label": "Python: defusedxml", "why": "ler XML com segurança", "apt": "python3-defusedxml"},
     {"type": "py", "name": "PIL", "pip": "pillow", "label": "Python: Pillow", "why": "imagens", "apt": "python3-pil", "pacman": "python-pillow", "dnf": "python3-pillow"},

@@ -118,7 +118,7 @@ Essas opções são o **padrão** da conta, mas dá para mudar só numa abertura
 | `/verify` | confere quais CLIs estão instaladas e se as credenciais AWS funcionam |
 | `/install` | instala as CLIs cadastradas que faltam |
 | `/update` | atualiza as CLIs para a versão mais recente, pelo mesmo meio em que foram instaladas, e troca os modelos fixados numa versão antiga pelo mais recente de cada conta |
-| `/skills` | lista e instala skills a partir do GitHub |
+| `/skills` | lista, instala e atualiza skills a partir do GitHub |
 | `/quit` | sai (ou `Esc`) |
 
 Basta o começo do comando: `/in` vira `/install`, e o Tab completa.
@@ -151,10 +151,12 @@ Skills são instruções extras (`SKILL.md`) que os agentes carregam sozinhos: a
 
 ![Skills instaladas e sugestões](docs/skills.png)
 
-- **Sugestões prontas** de fontes oficiais (Cloudflare, OpenAI, Anthropic, Vercel), ou cole qualquer repositório do GitHub.
+- **Sugestões prontas** de fontes oficiais (Cloudflare, OpenAI, Anthropic, Vercel), ou cole qualquer repositório do GitHub: `dono/repositório`, `dono/repositório@branch`, o link do GitHub (https ou SSH, inclusive de uma pasta ou branch específica), um link do skills.sh ou a linha `npx skills add …`. A branch do link é respeitada na instalação e nas atualizações seguintes.
 - **Sempre a versão mais recente**, baixada na hora do repositório oficial.
-- **Dependências conferidas antes**: pacotes Python e Node o hub instala sozinho (se o npm global for do root, mostra o comando com `sudo`); programas do sistema ele instala pelo Homebrew no macOS, pelo `apt`, `dnf`, `zypper`, `pacman` ou `apk` no Linux (o terminal roda com sudo; a interface mostra o comando) e pelo `winget` no Windows.
-- **Repositórios fora do catálogo**: o hub deduz as dependências pelos arquivos da própria skill (`requirements.txt`, `pyproject.toml`, `package.json`, imports dos scripts Python e Node, comandos `pip`, `npm -g`, `brew` e `apt` citados no SKILL.md) e mostra a evidência de cada uma. Também lê a licença e o campo `compatibility` do SKILL.md, exibe um trecho do README e lista os passos que o SKILL.md pede e o hub não faz sozinho, como variáveis de ambiente e comandos de setup. A tabela curada do hub só vale para a skill do catálogo vinda do repositório oficial; uma pasta de mesmo nome em outro repositório é analisada pelos próprios arquivos.
+- **Dependências conferidas antes**: pacotes Python e Node o hub instala sozinho (se o npm global for do root, mostra o comando com `sudo`); programas do sistema ele instala pelo Homebrew no macOS, pelo `apt`, `dnf`, `zypper`, `yum`, `pacman` ou `apk` no Linux (o terminal roda com sudo; a interface mostra o comando) e pelo `winget` no Windows.
+- **Repositórios fora do catálogo**: o hub deduz as dependências pelos arquivos da própria skill (`requirements.txt`, `pyproject.toml`, `package.json`, imports dos scripts Python e Node, comandos `pip`, `npm -g`, `brew` e `apt` citados no SKILL.md, o campo `dependencies` do cabeçalho e programas conhecidos que os scripts chamam, como LibreOffice, pandoc, poppler, ffmpeg e Tesseract) e mostra a evidência de cada uma. Versões pedidas no `requirements.txt` são respeitadas, e se a skill traz um `package.json` com dependências o hub roda `npm install` na pasta dela ao instalar (sem scripts de pós-instalação). Também lê a licença e o campo `compatibility` do SKILL.md, exibe um trecho do README e lista os passos que o SKILL.md pede e o hub não faz sozinho, como variáveis de ambiente e comandos de setup. A tabela curada do hub só vale para a skill do catálogo vinda do repositório oficial; uma pasta de mesmo nome em outro repositório é analisada pelos próprios arquivos.
+- **Aviso de versão nova**: a interface confere o GitHub em segundo plano e marca as skills cujo repositório mudou; **Atualizar N skills** baixa todas de uma vez. No terminal: `hub skills update` (ou a opção "Atualizar as skills instaladas" em `/skills`).
+- **Suas edições ficam protegidas**: se você mudou uma skill na sua máquina depois de instalar, o hub avisa e só sobrescreve com a sua confirmação.
 - **Mais contas**: leve uma skill instalada para outras contas com um clique.
 - **Use direto pelo hub**: `hub skill <nome>` (ou o número da skill em `/skills`) abre a CLI da conta já rodando a skill.
 

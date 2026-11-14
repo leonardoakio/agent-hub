@@ -224,7 +224,7 @@ const INSTALL_WAYS = {
     native: IS_WIN ? null : { install: 'curl -fsSL https://gh.io/copilot-install | bash' },
     winget: 'GitHub.Copilot',
   },
-  agy: { native: { install: IS_WIN ? PS1('irm https://antigravity.google/cli/install.ps1 | iex') : 'curl -fsSL https://antigravity.google/cli/install.sh | bash' } },
+  agy: { native: { install: IS_WIN ? PS1('irm https://antigravity.google/cli/install.ps1 | iex') : 'curl -fsSL https://antigravity.google/cli/install.sh | bash' }, brew: { cask: 'antigravity-cli' } },
 };
 const METHOD_LABEL = {
   npm: 'npm', pnpm: 'pnpm', yarn: 'Yarn', bun: 'Bun', brew: 'Homebrew', native: 'instalador oficial',
@@ -935,14 +935,38 @@ function skillTargets() {
   return [...map.values()];
 }
 
-// Só GitHub, por segurança.
+// Só GitHub, por segurança. Aceita dono/repo, dono/repo@branch, link do GitHub (https ou SSH, com /tree/branch/pasta),
+// link do skills.sh e a linha "npx skills add dono/repo".
 function parseSource(src) {
-  const text = String(src || '').trim().replace(/^https?:\/\//, '').replace(/^(www\.)?github\.com\//, '').replace(/[#?].*$/, '');
-  const m = text.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:\/(?:tree|blob)\/([A-Za-z0-9_.-]+)(?:\/(.*))?)?\/?$/);
-  if (!m || m[1].startsWith('.') || m[2].startsWith('.')) throw new Error('use o formato dono/repositório ou um link do GitHub, ex.: cloudflare/security-audit-skill');
-  const sub = (m[4] || '').replace(/\/?SKILL\.md$/, '').replace(/\/$/, '');
-  if (sub.split(/[\\/]/).includes('..')) throw new Error('caminho inválido');
-  return { url: `https://github.com/${m[1]}/${m[2]}.git`, label: `${m[1]}/${m[2]}`, branch: m[3] || '', sub };
+  const bad = () => new Error('use o formato dono/repositório ou um link do GitHub, ex.: cloudflare/security-audit-skill');
+  let text = String(src || '').trim().replace(/^npx\s+(?:-y\s+|--yes\s+)?skills\s+add\s+/i, '').split(/\s+/)[0] || '';
+  const fromSkillsSh = /^(https?:\/\/)?(www\.)?skills\.sh\//i.test(text);
+  text = text.replace(/^git@github\.com:/i, '').replace(/^ssh:\/\/git@github\.com\//i, '').replace(/^https?:\/\//i, '')
+    .replace(/^(www\.)?github\.com\//i, '').replace(/^(www\.)?skills\.sh\//i, '').replace(/[#?].*$/, '');
+  let at = '', only = '';
+  const am = text.match(/^([^/@]+\/[^/@]+)@([A-Za-z0-9_.][A-Za-z0-9_./-]*)$/);
+  if (am) { text = am[1]; at = am[2].replace(/\/+$/, ''); }
+  if (fromSkillsSh) { const seg = text.split('/').filter(Boolean); text = seg.slice(0, 2).join('/'); only = seg[2] || ''; }
+  const m = text.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:\/(?:tree|blob)\/(.+?))?\/?$/);
+  if (!m || m[1].startsWith('.') || m[2].startsWith('.')) throw bad();
+  const segs = (m[3] || '').replace(/\/?SKILL\.md$/, '').split('/').filter(Boolean);
+  if ([...segs, ...at.split('/')].some((x) => x === '..' || (x && !/^[A-Za-z0-9_.-]+$/.test(x)))) throw new Error('caminho inválido');
+  if (only && !SKILL_NAME_RE.test(only)) only = '';
+  // em /tree/a/b/c não dá para saber onde a branch termina: vale o primeiro trecho, e fetchSource confere no GitHub se falhar
+  return { url: `https://github.com/${m[1]}/${m[2]}.git`, label: `${m[1]}/${m[2]}`, branch: at || segs[0] || '', sub: at ? '' : segs.slice(1).join('/'), refPath: at ? '' : segs.join('/'), only };
+}
+// Origem como fica gravada na skill e volta para parseSource: dono/repo, ou dono/repo@branch fora da branch padrão.
+const sourceRef = (label, branch) => (branch ? `${label}@${branch}` : label);
+const GIT_QUIET = { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_ASKPASS: 'true' };
+// Branch com barra (feature/x) num link /tree/feature/x/pasta: a maior branch ou tag que existe no GitHub decide o corte.
+async function resolveRef(url, refPath) {
+  const segs = String(refPath || '').split('/').filter(Boolean);
+  if (segs.length < 2) return null;
+  const r = await run('git', ['ls-remote', '--heads', '--tags', url], 30000, GIT_QUIET);
+  if (!r.ok) return null;
+  const refs = new Set(r.stdout.split('\n').map((l) => (l.split('\t')[1] || '').replace(/^refs\/(heads|tags)\//, '').replace(/\^\{\}$/, '')));
+  for (let k = segs.length; k >= 2; k--) { const b = segs.slice(0, k).join('/'); if (refs.has(b)) return { branch: b, sub: segs.slice(k).join('/') }; }
+  return null;
 }
 
 const dropSource = (entry) => { if (entry) fs.rmSync(entry.dir, { recursive: true, force: true }); };
@@ -954,47 +978,104 @@ function retireSource(entry) {
 }
 
 const sourceCache = new Map();
-async function fetchSource(src, { fresh = false } = {}) {
-  const { url, label, branch, sub } = parseSource(src);
-  const key = `${label}#${branch}`;
-  const cached = sourceCache.get(key);
-  if (!fresh && cached && Date.now() - cached.at < 10 * 60 * 1000 && fs.existsSync(cached.dir)) return { label, ...filterSub(cached, sub) };
-  if (cached) { retireSource(cached); sourceCache.delete(key); }
-  if (!(await which('git'))) throw new Error(`git não está instalado: as skills vêm do GitHub por ele (${IS_WIN ? 'winget install --id Git.Git -e' : IS_MAC ? 'xcode-select --install' : 'sudo apt install git'})`);
-  progress(8, `Baixando ${label} do GitHub`, 46);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-skill-'));
-  const r = await run('git', ['clone', '--depth', '1', '--quiet', ...(branch ? ['--branch', branch] : []), url, dir], 120000,
-    { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_ASKPASS: 'true' });
-  if (!r.ok) {
-    fs.rmSync(dir, { recursive: true, force: true });
-    const why = /could not read Username|Authentication failed|not found/i.test(r.stderr) ? 'repositório não encontrado ou privado'
-      : /Could not resolve host|unable to access|Failed to connect|timed out/i.test(r.stderr) ? 'sem conexão com o GitHub (rede ou proxy)'
-        : r.code === null || /timed out/i.test(String(r.code)) ? 'demorou demais (rede lenta?)' : r.stderr.split('\n').filter(Boolean).pop();
-    throw new Error(`não consegui baixar ${label}${branch ? ` (${branch})` : ''}: ${why || 'repositório não encontrado'}`);
-  }
-  progress(48, 'Lendo as skills do repositório', 54);
+const SKILL_DEPTH = 6;
+// Skills (pastas com SKILL.md) a partir de uma pasta do clone. A raiz do repositório só conta se for a única.
+function findSkills(root, from, repoName) {
   const skills = [];
   const walk = (d, depth) => {
-    if (depth > 4) return;
+    if (depth > SKILL_DEPTH) return;
     const meta = skillMeta(d);
-    if (meta && d !== dir) { skills.push({ ...meta, dir: d, folder: path.basename(d) }); return; }
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      if (e.isDirectory() && !['.git', 'node_modules'].includes(e.name)) walk(path.join(d, e.name), depth + 1);
-    }
+    if (meta && d !== root) { skills.push({ ...meta, dir: d, folder: path.basename(d) }); return; }
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) if (e.isDirectory() && !['.git', 'node_modules'].includes(e.name)) walk(path.join(d, e.name), depth + 1);
   };
-  walk(dir, 0);
-  if (!skills.length && skillMeta(dir)) skills.push({ ...skillMeta(dir), dir, folder: parseSource(src).label.split('/')[1] });
-  if (!skills.length) { fs.rmSync(dir, { recursive: true, force: true }); throw new Error(`nenhuma skill (SKILL.md) encontrada em ${label}`); }
-  const countFiles = (d) => fs.readdirSync(d, { withFileTypes: true }).reduce((n, e) =>
-    e.name === '.git' ? n : n + (e.isDirectory() ? countFiles(path.join(d, e.name)) : 1), 0);
+  walk(from, 0);
+  if (!skills.length && from === root) {
+    const meta = skillMeta(root);
+    // skill na raiz: a pasta leva o nome declarado no SKILL.md (é o que os agentes esperam), não o do repositório
+    if (meta) skills.push({ ...meta, dir: root, folder: SKILL_NAME_RE.test(meta.name) ? meta.name : repoName });
+  }
+  return skills;
+}
+const countFiles = (d) => fs.readdirSync(d, { withFileTypes: true }).reduce((n, e) =>
+  e.name === '.git' ? n : n + (e.isDirectory() ? countFiles(path.join(d, e.name)) : 1), 0);
+// Duas pastas com o mesmo nome no repositório (ex.: skills/.curated/x e skills/.system/x) iriam para o mesmo destino:
+// fica a que não está em pasta oculta, depois a mais rasa; as outras viram "also" (para escolher uma delas, use o link da pasta).
+function dedupeSkills(skills, root) {
+  const rank = (sk) => { const rel = path.relative(root, sk.dir).split(path.sep); return [rel.some((x) => x.startsWith('.')) ? 1 : 0, rel.length, rel.join('/')]; };
+  const best = new Map();
+  for (const sk of skills) {
+    const cur = best.get(sk.folder);
+    if (!cur) { best.set(sk.folder, { ...sk, also: [] }); continue; }
+    const a = rank(sk), b = rank(cur);
+    const wins = a[0] !== b[0] ? a[0] < b[0] : a[1] !== b[1] ? a[1] < b[1] : a[2] < b[2];
+    const lost = wins ? cur : sk;
+    const kept = wins ? { ...sk, also: cur.also } : cur;
+    kept.also.push(path.relative(root, lost.dir).split(path.sep).join('/'));
+    best.set(sk.folder, kept);
+  }
+  return [...best.values()];
+}
+async function fetchSource(src, { fresh = false } = {}) {
+  const parsed = parseSource(src);
+  const { url, label, only } = parsed;
+  let { branch, sub } = parsed;
+  const finish = (entry) => {
+    let list = filterSub(entry, sub).skills;
+    if (sub && !list.length) {
+      // pasta apontada pelo link mais funda que a busca geral: procura a partir dela
+      const from = path.join(entry.dir, sub);
+      if (insideDir(entry.dir, from) && fs.existsSync(from)) {
+        const own = skillMeta(from);
+        list = own ? [{ ...own, dir: from, folder: path.basename(from) }] : findSkills(entry.dir, from, label.split('/')[1]);
+        for (const sk of list) { sk.files = countFiles(sk.dir); entry.skills.push(sk); }
+      }
+    }
+    list = dedupeSkills(list, entry.dir).map((sk) => ({ ...sk, path: path.relative(entry.dir, sk.dir).split(path.sep).join('/') }));
+    if (only && list.some((sk) => sk.folder === only)) list = list.filter((sk) => sk.folder === only);
+    if (!list.length) throw new Error(`nenhuma skill (SKILL.md) em ${label}${sub ? `/${sub}` : ''}`);
+    // ref: o que a interface devolve nas próximas chamadas (mantém branch e pasta); stored: o que fica gravado na skill
+    const ref = branch ? `https://github.com/${label}/tree/${branch}${sub ? `/${sub}` : ''}` : label;
+    return { label, branch, sub, ref, stored: sourceRef(label, branch), ...entry, skills: list };
+  };
+  let key = `${label}#${branch}`;
+  let cached = sourceCache.get(key);
+  if (!fresh && cached && Date.now() - cached.at < 10 * 60 * 1000 && fs.existsSync(cached.dir)) return finish(cached);
+  if (!(await which('git'))) throw new Error(`git não está instalado: as skills vêm do GitHub por ele (${IS_WIN ? 'winget install --id Git.Git -e' : IS_MAC ? 'xcode-select --install' : 'sudo apt install git'})`);
+  progress(8, `Baixando ${label} do GitHub`, 46);
+  const clone = (dir) => run('git', ['clone', '--depth', '1', '--quiet', ...(branch ? ['--branch', branch] : []), url, dir], 120000, GIT_QUIET);
+  let dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-skill-'));
+  let r = await clone(dir);
+  if (!r.ok && branch && parsed.refPath && /Remote branch .* not found|Could not find remote branch/i.test(r.stderr)) {
+    const real = await resolveRef(url, parsed.refPath);
+    if (real) {
+      ({ branch, sub } = real);
+      key = `${label}#${branch}`;
+      cached = sourceCache.get(key);
+      fs.rmSync(dir, { recursive: true, force: true });
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-skill-'));
+      r = await clone(dir);
+    }
+  }
+  if (!r.ok) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    const why = /Remote branch .* not found|Could not find remote branch/i.test(r.stderr) ? `a branch "${branch}" não existe nesse repositório`
+      : /could not read Username|Authentication failed|not found/i.test(r.stderr) ? 'repositório não encontrado ou privado'
+        : /Could not resolve host|unable to access|Failed to connect|timed out/i.test(r.stderr) ? 'sem conexão com o GitHub (rede ou proxy)'
+          : r.code === null || /timed out/i.test(String(r.code)) ? 'demorou demais (rede lenta?)' : r.stderr.split('\n').filter(Boolean).pop();
+    throw new Error(`não consegui baixar ${label}${branch ? ` (${branch})` : ''}: ${why || 'repositório não encontrado'}`);
+  }
+  if (cached) { retireSource(cached); sourceCache.delete(key); }
+  progress(48, 'Lendo as skills do repositório', 54);
+  const skills = findSkills(dir, dir, label.split('/')[1]);
+  if (!skills.length && !sub) { fs.rmSync(dir, { recursive: true, force: true }); throw new Error(`nenhuma skill (SKILL.md) encontrada em ${label}`); }
   for (const sk of skills) sk.files = countFiles(sk.dir);
-  const head = await run('git', ['-C', dir, 'log', '-1', '--format=%h|%cd', '--date=short']);
-  const [commit = '', date = ''] = head.stdout.split('|');
-  const entry = { dir, skills, commit, date, at: Date.now() };
+  const head = await run('git', ['-C', dir, 'log', '-1', '--format=%h|%cd|%H', '--date=short']);
+  const [commit = '', date = '', sha = ''] = head.stdout.split('|');
+  const entry = { dir, skills, commit, date, sha, at: Date.now() };
   sourceCache.set(key, entry);
-  const out = filterSub(entry, sub);
-  if (!out.skills.length) throw new Error(`nenhuma skill (SKILL.md) em ${label}/${sub}`);
-  return { label, ...out };
+  return finish(entry);
 }
 
 function filterSub(entry, sub) {
@@ -1062,6 +1143,31 @@ const PKG_BIN = {
   'tesseract-ocr': 'tesseract', graphviz: 'dot', nodejs: 'node', 'python3-pip': 'pip3', 'build-essential': 'gcc', coreutils: '', 'ca-certificates': '', 'libmagic1': '',
 };
 const PKG_LABEL = { pillow: 'Pillow', pyyaml: 'PyYAML' };
+// Programas que os scripts de skills costumam chamar: nome no PATH → como instalar em cada sistema.
+// Só entram na lista de uma skill quando aparecem nos arquivos dela (ver inferDeps).
+const KNOWN_BINS = {
+  soffice: { label: 'LibreOffice', alias: ['libreoffice'], apt: 'libreoffice', brew: 'libreoffice', brewCask: true, pacman: 'libreoffice-fresh', winget: 'TheDocumentFoundation.LibreOffice', manual: 'https://www.libreoffice.org/download/' },
+  pandoc: { label: 'pandoc', apt: 'pandoc', brew: 'pandoc', pacman: 'pandoc-cli', winget: 'JohnMacFarlane.Pandoc', manual: 'https://pandoc.org/installing.html' },
+  pdftoppm: { label: 'poppler-utils', alias: ['pdftotext', 'pdfimages', 'pdfinfo', 'pdftocairo'], apt: 'poppler-utils', zypper: 'poppler-tools', brew: 'poppler', pacman: 'poppler', apk: 'poppler-utils', winget: 'oschwartz10612.Poppler', manual: 'https://poppler.freedesktop.org' },
+  qpdf: { label: 'qpdf', apt: 'qpdf', brew: 'qpdf', pacman: 'qpdf', apk: 'qpdf', winget: 'QPDF.QPDF', manual: 'https://qpdf.readthedocs.io/en/stable/installation.html' },
+  ffmpeg: { label: 'ffmpeg', alias: ['ffprobe'], apt: 'ffmpeg', brew: 'ffmpeg', pacman: 'ffmpeg', apk: 'ffmpeg', winget: 'Gyan.FFmpeg', manual: 'https://ffmpeg.org/download.html' },
+  magick: { label: 'ImageMagick', apt: 'imagemagick', dnf: 'ImageMagick', zypper: 'ImageMagick', brew: 'imagemagick', pacman: 'imagemagick', apk: 'imagemagick', winget: 'ImageMagick.ImageMagick', manual: 'https://imagemagick.org/script/download.php' },
+  tesseract: { label: 'Tesseract OCR', apt: 'tesseract-ocr', dnf: 'tesseract', zypper: 'tesseract-ocr', brew: 'tesseract', pacman: 'tesseract', apk: 'tesseract-ocr', winget: 'UB-Mannheim.TesseractOCR', manual: 'https://tesseract-ocr.github.io/tessdoc/Installation.html' },
+  rg: { label: 'ripgrep (rg)', apt: 'ripgrep', brew: 'ripgrep', pacman: 'ripgrep', apk: 'ripgrep', winget: 'BurntSushi.ripgrep.MSVC', manual: 'https://github.com/BurntSushi/ripgrep#installation' },
+  jq: { label: 'jq', apt: 'jq', brew: 'jq', pacman: 'jq', apk: 'jq', winget: 'jqlang.jq', manual: 'https://jqlang.org/download/' },
+  gh: { label: 'GitHub CLI (gh)', apt: 'gh', brew: 'gh', pacman: 'github-cli', apk: 'github-cli', winget: 'GitHub.cli', manual: 'https://cli.github.com' },
+  dot: { label: 'Graphviz (dot)', apt: 'graphviz', brew: 'graphviz', pacman: 'graphviz', apk: 'graphviz', winget: 'Graphviz.Graphviz', manual: 'https://graphviz.org/download/' },
+  gs: { label: 'Ghostscript', apt: 'ghostscript', brew: 'ghostscript', pacman: 'ghostscript', apk: 'ghostscript', manual: 'https://ghostscript.com/releases/' },
+  exiftool: { label: 'ExifTool', apt: 'libimage-exiftool-perl', dnf: 'perl-Image-ExifTool', zypper: 'exiftool', brew: 'exiftool', pacman: 'perl-image-exiftool', apk: 'exiftool', winget: 'OliverBetz.ExifTool', manual: 'https://exiftool.org/install.html' },
+  sqlite3: { label: 'SQLite (sqlite3)', apt: 'sqlite3', dnf: 'sqlite', brew: 'sqlite', pacman: 'sqlite', apk: 'sqlite', winget: 'SQLite.SQLite', manual: 'https://sqlite.org/download.html' },
+  'yt-dlp': { label: 'yt-dlp', apt: 'yt-dlp', brew: 'yt-dlp', pacman: 'yt-dlp', apk: 'yt-dlp', winget: 'yt-dlp.yt-dlp', manual: 'https://github.com/yt-dlp/yt-dlp#installation' },
+  docker: { label: 'Docker', manual: 'https://docs.docker.com/get-docker/' },
+};
+const BIN_OF_ALIAS = Object.fromEntries(Object.entries(KNOWN_BINS).flatMap(([bin, d]) => [[bin, bin], ...(d.alias || []).map((x) => [x, bin])]));
+const BIN_WORD_RE = new RegExp(`(?<![\\w./-])(${Object.keys(BIN_OF_ALIAS).map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).sort((x, y) => y.length - x.length).join('|')})(?![\\w-])`, 'g');
+// Especificação do pip com versão (pandas>=1.5,<3): vai inteira para o pip, que respeita o que a skill pede.
+const PIP_SPEC_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(\[[A-Za-z0-9_,.-]{1,64}\])?((==|>=|<=|~=|!=|>|<)[A-Za-z0-9.*+!_-]{1,32}(,(==|>=|<=|~=|!=|>|<)[A-Za-z0-9.*+!_-]{1,32}){0,3})?$/;
+const pipSpecOf = (spec) => { const t = String(spec).trim().replace(/^-e\s+/, '').replace(/\s*;.*$/, '').replace(/\s+/g, ''); return PIP_SPEC_RE.test(t) ? t : ''; };
 const INFER_MAX_FILES = 400, INFER_MAX_BYTES = 512 * 1024;
 const SETUP_CMD_RE = /^(?:sudo\s+)?(?:(?:python3?|py)\s+-m\s+pip|pip3?|uv\s+pip|uv\s+(?:sync|tool\s+install|add)|npm|npx|pnpm|yarn|bun|brew|apt(?:-get)?|dnf|pacman|winget|choco|cargo|go|gem|playwright|poetry)\b/i;
 const ENV_VAR_RE = /\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:API_KEY|TOKEN|SECRET|ACCESS_KEY|CLIENT_ID|CLIENT_SECRET|PASSWORD|WEBHOOK))\b/g;
@@ -1106,6 +1212,7 @@ function codeLines(md) {
   return lines;
 }
 
+const PYTHON_DEP = { type: 'bin', name: IS_WIN ? 'python' : 'python3', label: 'Python 3', why: 'os scripts da skill são em Python', manual: 'https://www.python.org/downloads/', apt: 'python3', apk: 'python3', brew: 'python', winget: 'Python.Python.3.13', pacman: 'python' };
 // Dependências e passos deduzidos dos arquivos de uma skill. Cada item traz a evidência (de onde veio).
 function inferDeps(dir, folder) {
   const deps = new Map(), steps = [], envVars = new Set();
@@ -1123,7 +1230,17 @@ function inferDeps(dir, folder) {
     if (!pkg || !DEP_NAME_RE.test(pkg) || pkg.startsWith('-')) return;
     const mod = importOf(pkg);
     if (!PY_MOD_RE.test(mod)) return;
-    add({ type: 'py', name: mod, pip: pkg, label: pipLabel(pkg), why: 'usado pelos scripts da skill', optional }, evidence);
+    const d = add({ type: 'py', name: mod, pip: pkg, label: pipLabel(pkg), why: 'usado pelos scripts da skill', optional }, evidence);
+    const full = pipSpecOf(spec);
+    if (full && full !== pkg && !d.spec) d.spec = full;
+  };
+  // programa conhecido citado num arquivo da skill; em script conta como necessário, em texto do SKILL.md como opcional
+  const addKnownBin = (word, evidence, optional) => {
+    const bin = BIN_OF_ALIAS[word];
+    if (!bin) return;
+    const k = KNOWN_BINS[bin];
+    const d = add({ type: 'bin', name: bin, label: k.label, why: optional ? 'programa citado no SKILL.md' : 'programa chamado pelos scripts da skill', optional }, evidence);
+    for (const key of ['apt', 'dnf', 'zypper', 'pacman', 'apk', 'brew', 'brewCask', 'winget', 'manual']) if (k[key] && d[key] === undefined) d[key] = k[key];
   };
   const addSysPkg = (pkg, pm, evidence) => {
     if (!DEP_NAME_RE.test(pkg)) return;
@@ -1162,7 +1279,9 @@ function inferDeps(dir, folder) {
       let pkg = null;
       try { pkg = JSON.parse(readSmall(f) || ''); } catch {}
       const list = Object.keys({ ...(pkg && pkg.dependencies), ...(pkg && pkg.devDependencies) });
-      if (list.length) steps.push({ kind: 'cmd', title: `Pacotes Node dos scripts (${list.slice(0, 6).join(', ')}${list.length > 6 ? '…' : ''})`, detail: `rode npm install na pasta ${path.dirname(r) === '.' ? 'da skill' : `${folder}/${path.dirname(r)}`} depois de instalar`, cmd: 'npm install', evidence: r });
+      const prod = Object.keys({ ...(pkg && pkg.dependencies) });
+      if (prod.length) steps.push({ kind: 'auto', title: `Pacotes Node dos scripts (${prod.slice(0, 6).join(', ')}${prod.length > 6 ? '…' : ''})`, detail: `o hub roda npm install na pasta ${path.dirname(r) === '.' ? 'da skill' : `${folder}/${path.dirname(r)}`} ao instalar, sem scripts de pós-instalação`, cmd: '', evidence: r });
+      else if (list.length) steps.push({ kind: 'cmd', title: `Pacotes Node de desenvolvimento (${list.slice(0, 6).join(', ')}${list.length > 6 ? '…' : ''})`, detail: 'só para os testes da própria skill', cmd: 'npm install', evidence: r });
     }
   }
   // 2) scripts: imports Python, requires Node e shebangs
@@ -1175,18 +1294,31 @@ function inferDeps(dir, folder) {
     const sb = s.match(/^#![^\n]*/);
     if (sb) { const w = sb[0].replace(/^#!\s*\S*\/(?:env\s+(?:-S\s+)?)?/, '').split(/\s/)[0]; if (w) shebangs.add(w.replace(/\d+(\.\d+)*$/, (v) => (w.startsWith('python') ? '3' : ''))); }
     if (/\.py$/.test(f)) {
-      for (const m of s.matchAll(/^[ \t]*(?:from[ \t]+([A-Za-z_][\w]*)[\w.]*[ \t]+import|import[ \t]+([A-Za-z_][\w]*))/gm)) {
-        const mod = m[1] || m[2];
-        if (PY_STDLIB.has(mod) || localModule(mod) || PY_IMPORT_PKG[mod] === '') continue;
-        if (!pyImports.has(mod)) pyImports.set(mod, r);
+      for (const m of s.matchAll(/^[ \t]*(?:from[ \t]+([A-Za-z_][\w]*)[\w.]*[ \t]+import|import[ \t]+([^\n#;]+))/gm)) {
+        // "import a, b.c as d": cada item da lista conta
+        const mods = m[1] ? [m[1]] : m[2].split(',').map((x) => x.trim().split(/[\s.]/)[0]).filter((x) => /^[A-Za-z_]\w*$/.test(x));
+        for (const mod of mods) {
+          if (PY_STDLIB.has(mod) || localModule(mod) || PY_IMPORT_PKG[mod] === '') continue;
+          if (!pyImports.has(mod)) pyImports.set(mod, r);
+        }
       }
     } else if (/\.(js|cjs|mjs|ts)$/.test(f)) {
       for (const m of s.matchAll(/(?:require\(\s*|from\s+|import\s+)['"]([^'"./][^'"]*)['"]/g)) {
-        const mod = m[1].replace(/^node:/, '').split('/').slice(0, m[1].startsWith('@') ? 2 : 1).join('/');
+        if (m[1].startsWith('node:')) continue; // módulo do próprio Node (node:test, node:fs…)
+        const mod = m[1].split('/').slice(0, m[1].startsWith('@') ? 2 : 1).join('/');
         if (require('module').builtinModules.includes(mod) || !DEP_NAME_RE.test(mod)) continue;
         if (!nodeReqs.has(mod)) nodeReqs.set(mod, r);
       }
     }
+  }
+  // programas conhecidos chamados pelos scripts: entre aspas (subprocess, execFile…) ou como comando num .sh
+  for (const f of files) {
+    if (!/\.(py|js|cjs|mjs|ts|sh|bash)$/.test(f)) continue;
+    const text = readSmall(f);
+    if (text == null) continue;
+    const isShell = /\.(sh|bash)$/.test(f);
+    const hay = isShell ? text.replace(/^\s*#.*$/gm, '') : [...text.matchAll(/(["'`])((?:(?!\1)[^\n\\]){1,200})\1/g)].map((q) => q[2]).filter((q) => /^[\w.-]+( |$)/.test(q)).map((q) => q.split(/\s/)[0]).join('\n');
+    for (const m of hay.matchAll(BIN_WORD_RE)) addKnownBin(m[1], `${rel(f)} chama ${m[1]}`, false);
   }
   for (const [mod, r] of pyImports) {
     const pkg = PY_IMPORT_PKG[mod] || mod;
@@ -1217,14 +1349,35 @@ function inferDeps(dir, folder) {
       consumed.add(line);
     }
   }
+  // cabeçalho do SKILL.md: dependencies: python>=3.8, pandas>=1.5.0
+  const fm = (md.replace(/\r\n/g, '\n').match(/^---\s*\n([\s\S]*?)\n---/) || [])[1] || '';
+  for (const item of fmValue(fm, 'dependencies').replace(/^\[|\]$/g, '').split(/[,\n]/).map((x) => x.replace(/^\s*-\s*/, '').replace(/^["']|["']$/g, '').trim()).filter(Boolean)) {
+    const base = pipName(item).toLowerCase();
+    if (/^python\d*$/.test(base)) shebangs.add('python3');
+    else if (/^node(js)?$/.test(base)) shebangs.add('node');
+    else if (BIN_OF_ALIAS[base]) addKnownBin(base, 'SKILL.md: dependencies', false);
+    else addPip(item, 'SKILL.md: dependencies');
+  }
+  // programas conhecidos usados nos comandos de exemplo do SKILL.md (primeira palavra de cada comando)
+  for (const line of codeLines(md)) {
+    const first = line.replace(/^sudo\s+/, '').split(/\s+/)[0];
+    if (BIN_OF_ALIAS[first]) addKnownBin(first, `SKILL.md: ${line.slice(0, 60)}`, true);
+  }
+  // …e em trechos de código no meio do texto (`pandoc -t markdown arquivo.docx`)
+  for (const m of md.replace(/\`\`\`[\s\S]*?\`\`\`/g, '').matchAll(/\`([^\`\n]{2,160})\`/g)) {
+    const first = m[1].trim().split(/\s+/)[0];
+    if (BIN_OF_ALIAS[first]) addKnownBin(first, `SKILL.md: ${m[1].trim().slice(0, 60)}`, true);
+  }
   // 4) programas usados pelos shebangs
-  if (shebangs.has('python3') || shebangs.has('python') || pyImports.size) add({ type: 'bin', name: IS_WIN ? 'python' : 'python3', label: 'Python 3', why: 'os scripts da skill são em Python', manual: 'https://www.python.org/downloads/', apt: 'python3', brew: 'python', winget: 'Python.Python.3.13', pacman: 'python' }, 'scripts .py');
+  if (shebangs.has('python3') || shebangs.has('python') || pyImports.size) add({ ...PYTHON_DEP }, 'scripts .py');
   if (shebangs.has('node') || nodeReqs.size) add({ type: 'bin', name: 'node', label: 'Node.js', why: 'os scripts da skill são em Node', manual: 'https://nodejs.org', apt: 'nodejs', brew: 'node', winget: 'OpenJS.NodeJS.LTS', pacman: 'nodejs' }, 'scripts .js');
   // 5) passos que o hub não faz sozinho: outros comandos de setup e variáveis de ambiente
   const seenCmd = new Set();
   for (const line of codeLines(md)) {
     if (consumed.has(line) || seenCmd.has(line) || !SETUP_CMD_RE.test(line)) continue;
     if (!/\b(install|add|sync|init|login|auth|setup)\b/i.test(line) || /\b(run|test|start|exec|build)\b/i.test(line.split(/\s+/)[1] || '')) continue;
+    // "pip install" ou "npm install" citados soltos no texto, sem dizer o quê: não é um passo
+    if (/^(?:sudo\s+)?(?:(?:python3?|py)\s+-m\s+pip|pip3?|uv\s+pip|npm|pnpm|yarn|bun|brew|apt(?:-get)?|dnf|pacman|winget|choco|cargo|gem)\s+(?:install|add|i)\s*$/i.test(line)) continue;
     seenCmd.add(line);
     if (steps.length < 8) steps.push({ kind: 'cmd', title: 'Comando pedido pelo SKILL.md', detail: '', cmd: line.slice(0, 160), evidence: 'SKILL.md' });
   }
@@ -1275,7 +1428,12 @@ async function depsFor(folders, opts = {}) {
     const cat = catalogItemOf(f);
     const curated = cat && (!where || !where.label || sameRepo(cat.source, where.label));
     let list = [];
-    if (curated) { list = Array.isArray(all[f]) ? all[f] : []; origin[f] = 'catalogo'; }
+    if (curated) {
+      list = Array.isArray(all[f]) ? [...all[f]] : []; origin[f] = 'catalogo';
+      // módulos Python pedem o próprio Python: entra aqui para não depender de cada item da curadoria lembrar
+      const py = list.filter((d) => d.type === 'py');
+      if (py.length && !list.some((d) => d.type === 'bin' && /^python3?$/.test(d.name))) list.unshift({ ...PYTHON_DEP, optional: py.every((d) => d.optional) });
+    }
     else if (where) {
       const inf = inferDeps(where.dir, f);
       list = inf.deps; origin[f] = 'inferida';
@@ -1297,6 +1455,7 @@ async function depsFor(folders, opts = {}) {
 const SYS_PMS = [
   { id: 'apt', bin: 'apt-get', key: 'apt', args: (p) => ['apt', 'install', '-y', ...p], pipPkg: 'python3-pip', py: (pip) => `python3-${pip.toLowerCase()}`, fallbackKey: 'apt' },
   { id: 'dnf', bin: 'dnf', key: 'dnf', args: (p) => ['dnf', 'install', '-y', ...p], pipPkg: 'python3-pip', py: (pip) => `python3-${pip.toLowerCase()}`, fallbackKey: 'apt' },
+  { id: 'yum', bin: 'yum', key: 'dnf', args: (p) => ['yum', 'install', '-y', ...p], pipPkg: 'python3-pip', py: (pip) => `python3-${pip.toLowerCase()}`, fallbackKey: 'apt' },
   { id: 'zypper', bin: 'zypper', key: 'zypper', args: (p) => ['zypper', '--non-interactive', 'install', ...p], pipPkg: 'python3-pip', py: (pip) => `python3-${pip}`, fallbackKey: 'apt' },
   { id: 'pacman', bin: 'pacman', key: 'pacman', args: (p) => ['pacman', '-S', '--needed', '--noconfirm', ...p], pipPkg: 'python-pip', py: (pip) => `python-${pip.toLowerCase()}`, fallbackKey: '' },
   { id: 'apk', bin: 'apk', key: 'apk', args: (p) => ['apk', 'add', ...p], pipPkg: 'py3-pip', py: (pip) => `py3-${pip.toLowerCase()}`, fallbackKey: '' },
@@ -1353,18 +1512,21 @@ async function checkDeps(folders, opts = {}) {
   const need = deps.filter((d) => !d.ok && !d.optional);
   const sysPkgs = [...new Set(need.filter((d) => d.how === 'sys' || d.how === 'winget').map((d) => d.pkg))];
   if (pm && need.some((d) => d.how === 'needs-pip')) sysPkgs.push(pm.pipPkg);
-  const sysArgs = !sysPkgs.length ? [] : pm ? pm.args(sysPkgs) : IS_WIN ? ['winget', 'install', '-e', ...sysPkgs.flatMap((id) => ['--id', id])] : [];
+  // winget aceita um --id por comando: um comando por programa (sysRuns); nos gerenciadores do Linux vai tudo num só
+  const sysRuns = !sysPkgs.length ? [] : pm ? [pm.args(sysPkgs)]
+    : IS_WIN ? sysPkgs.map((id) => ['winget', 'install', '--id', id, '-e', '--accept-source-agreements', '--accept-package-agreements']) : [];
+  const sysArgs = sysRuns[0] || [];
   const sysSudo = Boolean(pm) && sysArgs.length > 0;
   const npmPkgs = [...new Set(need.filter((d) => d.how === 'npm-sudo').map((d) => d.npm))].filter((x) => DEP_NAME_RE.test(x));
   const npmArgs = npmPkgs.length ? ['npm', 'install', '-g', ...npmPkgs] : [];
-  const sysCommand = sysArgs.length ? `${sysSudo ? 'sudo ' : ''}${sysArgs.join(' ')}` : '';
+  const sysCommand = sysRuns.map((a) => `${sysSudo ? 'sudo ' : ''}${a.join(' ')}`).join('\n');
   return {
     deps,
     steps, compat, origin,
     inferred: deps.some((d) => d.inferred),
     allOk: need.length === 0,
     auto: need.filter((d) => ['pip', 'npm', 'brew'].includes(d.how)).map((d) => d.label),
-    sysCommand, sysArgs, sysSudo, sysPm: pm ? pm.id : IS_WIN && hasWinget ? 'winget' : '',
+    sysCommand, sysArgs, sysRuns, sysSudo, sysPm: pm ? pm.id : IS_WIN && hasWinget ? 'winget' : '',
     npmCommand: npmArgs.length ? `sudo ${npmArgs.join(' ')}` : '', npmArgs,
     aptCommand: sysCommand, // nome antigo, mantido para quem já consumia a API
     manual: need.filter((d) => d.how === 'manual').map((d) => ({ label: d.label, url: d.manual || '', pkg: d.apt || d.brew || '' })),
@@ -1376,7 +1538,7 @@ async function installDeps(folders, includeOptional = false, opts = {}) {
   progress(4, 'Conferindo o que falta', 12);
   const before = await checkDeps(folders, opts);
   const want = before.deps.filter((d) => !d.ok && (includeOptional || !d.optional));
-  const pip = before.hasPip ? [...new Set(want.filter((d) => d.how === 'pip').map((d) => d.pip))].filter((x) => DEP_NAME_RE.test(x)) : [];
+  const pip = before.hasPip ? [...new Set(want.filter((d) => d.how === 'pip').map((d) => (d.spec && PIP_SPEC_RE.test(d.spec) ? d.spec : d.pip)))].filter((x) => DEP_NAME_RE.test(x) || PIP_SPEC_RE.test(x)) : [];
   const npm = [...new Set(want.filter((d) => d.how === 'npm').map((d) => d.npm))].filter((x) => DEP_NAME_RE.test(x));
   const brew = [...new Set(want.filter((d) => d.how === 'brew' && !d.brewCask).map((d) => d.brew))].filter((x) => DEP_NAME_RE.test(x));
   const casks = [...new Set(want.filter((d) => d.how === 'brew' && d.brewCask).map((d) => d.brew))].filter((x) => DEP_NAME_RE.test(x));
@@ -1412,12 +1574,33 @@ async function installDeps(folders, includeOptional = false, opts = {}) {
   return { log, ...(await checkDeps(folders, opts)) };
 }
 
+// O que não conta como conteúdo da skill: marcas do hub e o que aparece só por usar a skill (pacotes instalados, cache do Python).
+const SKILL_IGNORE = new Set(['.git', '.hub-source', 'node_modules', '__pycache__', '.venv', '.DS_Store', '.pytest_cache']);
+const skillIgnored = (name) => SKILL_IGNORE.has(name) || name === INSTR_SKILL_MARK;
+// Impressão digital do conteúdo de uma skill instalada: serve para saber se ela foi editada depois da instalação.
+function dirHash(root) {
+  const h = crypto.createHash('sha256');
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true }).sort((x, y) => (x.name < y.name ? -1 : 1))) {
+      if (skillIgnored(e.name)) continue;
+      const f = path.join(d, e.name);
+      if (e.isDirectory()) { walk(f); continue; }
+      h.update(`${e.isSymbolicLink() ? 'l' : 'f'}:${path.relative(root, f).split(path.sep).join('/')}\0`);
+      if (e.isSymbolicLink()) h.update(fs.readlinkSync(f));
+      else if (e.isFile()) h.update(fs.readFileSync(f));
+      h.update('\0');
+    }
+  };
+  try { walk(root); return h.digest('hex').slice(0, 32); } catch { return ''; }
+}
+const storedHash = (dir) => ((safeRead(path.join(dir, '.hub-source')) || '').split('\n').find((l) => l.startsWith('sha256:')) || '').slice(7).trim();
+
 function dirEqual(a, b) {
   const list = (root) => {
     const out = [];
     const walk = (d) => {
       for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        if (e.name === '.git' || e.name === '.hub-source' || e.name === INSTR_SKILL_MARK) continue;
+        if (skillIgnored(e.name)) continue;
         const f = path.join(d, e.name);
         if (e.isDirectory()) walk(f); else out.push(`${e.isSymbolicLink() ? 'l' : e.isFile() ? 'f' : 'x'}:${path.relative(root, f)}`);
       }
@@ -1486,7 +1669,7 @@ function replaceSkillDir(srcDir, dest, sourceLine, fromRepo = false) {
     rmSafe(fresh);
     fs.cpSync(srcDir, fresh, { recursive: true, dereference: true, filter });
   }
-  if (sourceLine) writeSourceLine(fresh, sourceLine);
+  if (sourceLine) writeSourceLine(fresh, `${sourceLine}sha256:${dirHash(fresh)}\n`);
   const existed = fs.existsSync(real);
   if (existed) renameSafe(real, old);
   try {
@@ -1509,6 +1692,38 @@ async function touchSkillLock(folder, src, relPath) {
   writeReal(SKILL_LOCK, JSON.stringify(lock, null, 2));
 }
 
+// package.json dentro da skill com dependências: os scripts dela só rodam depois de um npm install naquela pasta.
+// Sem scripts de pós-instalação dos pacotes e sem gravar package-lock (a pasta da skill fica igual à do repositório).
+function localNodeDirs(dir) {
+  const out = [];
+  const walk = (d, depth) => {
+    if (depth > 3) return;
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    if (entries.some((e) => e.isFile() && e.name === 'package.json')) {
+      let pkg = null;
+      try { pkg = JSON.parse(readSmall(path.join(d, 'package.json')) || ''); } catch {}
+      if (pkg && isObj(pkg.dependencies) && Object.keys(pkg.dependencies).length && !fs.existsSync(path.join(d, 'node_modules'))) out.push(d);
+    }
+    for (const e of entries) if (e.isDirectory() && !skillIgnored(e.name)) walk(path.join(d, e.name), depth + 1);
+  };
+  walk(dir, 0);
+  return out;
+}
+async function npmLocal(skillDir, folder) {
+  const dirs = localNodeDirs(skillDir);
+  if (!dirs.length) return [];
+  if (!(await which('npm'))) return [`${folder}: os scripts usam pacotes Node, mas o npm não está instalado (https://nodejs.org). Depois rode npm install em ${homeRel(dirs[0])}`];
+  const log = [];
+  for (const d of dirs) {
+    const r = await run('npm', ['install', '--prefix', d, '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--no-package-lock', '--silent'], 10 * 60 * 1000);
+    log.push(r.ok ? `${folder}: pacotes Node instalados em ${homeRel(d)}`
+      : `${folder}: falhou ao instalar os pacotes Node em ${homeRel(d)} (${r.stderr.split('\n').filter(Boolean).pop() || 'npm falhou'}). Rode npm install nessa pasta`);
+  }
+  return log;
+}
+
+// force: sobrescreve mesmo que a skill tenha sido editada na máquina depois de instalada.
 async function updateSkill(body) {
   const folder = String(body.skill || '');
   if (!SKILL_NAME_RE.test(folder)) throw new Error('nome de skill inválido');
@@ -1525,8 +1740,8 @@ async function updateSkill(body) {
   // Skills do npx skills já têm a origem no lock; não gravamos nada dentro delas.
   let npxDir = readSkillLock().skills?.[folder] ? path.join(HOME, '.agents', 'skills') : null;
   try { if (npxDir) npxDir = fs.realpathSync(npxDir); } catch {}
-  const sourceLine = `${src.label}\n${src.commit} · ${src.date}\n`;
-  const seen = new Set(), updated = [], unchanged = [];
+  const sourceLine = `${src.stored}\n${src.commit} · ${src.date}\n`;
+  const seen = new Set(), updated = [], unchanged = [], modified = [], local = [];
   for (const t of holders) {
     const dest = path.join(t.dir, folder);
     let real = dest;
@@ -1536,14 +1751,63 @@ async function updateSkill(body) {
     const line = npxDir && path.dirname(real) === npxDir ? null : sourceLine;
     if (dirEqual(sk.dir, real)) {
       unchanged.push(t.display);
-      if (line && !lexists(path.join(real, '.hub-source')) && body.source) writeSourceLine(real, line);
-    } else {
-      replaceSkillDir(sk.dir, dest, line, true);
-      updated.push(t.display);
+      // conferida agora: a versão gravada acompanha o repositório, para a checagem de novidades não acusar de novo
+      if (line && (lexists(path.join(real, '.hub-source')) || body.source)) writeSourceLine(real, `${line}sha256:${dirHash(real)}\n`);
+      continue;
     }
+    // editada na máquina depois de instalada (a impressão digital gravada não bate mais): só troca com confirmação
+    const was = storedHash(real);
+    if (was && !body.force && dirHash(real) !== was) { modified.push(t.display); continue; }
+    const at = replaceSkillDir(sk.dir, dest, line, true);
+    updated.push(t.display);
+    local.push(...(await npmLocal(at, folder)));
   }
   if (updated.length) await touchSkillLock(folder, src, relPath);
-  return { skill: folder, source: src.label, commit: src.commit, date: src.date, updated, unchanged };
+  skillsCheckCache = null;
+  return { skill: folder, source: src.stored, commit: src.commit, date: src.date, updated, unchanged, modified, local };
+}
+
+// Há versão nova das skills instaladas? Uma consulta leve por repositório (git ls-remote), sem baixar nada.
+// O commit do repositório mudou ≠ a skill mudou: quem confirma é o Atualizar, que compara o conteúdo.
+let skillsCheckCache = null;
+async function skillsCheck({ fresh = false } = {}) {
+  if (!fresh && skillsCheckCache && Date.now() - skillsCheckCache.at < 10 * 60 * 1000) return skillsCheckCache.data;
+  const bySkill = new Map();
+  for (const t of skillTargets()) for (const sk of t.skills) if (sk.source && !bySkill.has(sk.folder)) bySkill.set(sk.folder, sk);
+  const refs = new Map();
+  for (const sk of bySkill.values()) { try { const p = parseSource(sk.source); refs.set(sk.source, p); } catch {} }
+  const heads = new Map(), errors = [];
+  if (refs.size && !(await which('git'))) return { checkedAt: new Date().toISOString(), skills: {}, updates: 0, errors: ['git não está instalado'] };
+  await Promise.all([...refs].map(async ([source, p]) => {
+    const r = await run('git', ['ls-remote', p.url, p.branch || 'HEAD'], 20000, GIT_QUIET);
+    const sha = r.ok ? (r.stdout.split('\n').find(Boolean) || '').split('\t')[0] : '';
+    if (sha) heads.set(source, sha); else errors.push(`${p.label}: ${r.ok ? 'branch não encontrada' : 'sem resposta do GitHub'}`);
+  }));
+  const skills = {};
+  for (const [folder, sk] of bySkill) {
+    const sha = heads.get(sk.source);
+    const current = (String(sk.version || '').match(/^[0-9a-f]{7,40}\b/) || [''])[0];
+    if (!sha) continue;
+    // sem commit gravado (skills do npx skills): não dá para comparar sem baixar
+    skills[folder] = { source: sk.source, current, latest: sha.slice(0, 7), update: Boolean(current) && !sha.startsWith(current), unknown: !current };
+  }
+  const data = { checkedAt: new Date().toISOString(), skills, updates: Object.values(skills).filter((x) => x.update).length, errors };
+  skillsCheckCache = { at: Date.now(), data };
+  return data;
+}
+// Atualiza todas as skills com origem conhecida (ou só as pedidas). Skills editadas na máquina ficam de fora e são listadas.
+async function updateAllSkills(body = {}) {
+  const only = asList(body.skills).map(String);
+  const folders = new Map();
+  for (const t of skillTargets()) for (const sk of t.skills) if (sk.source && !folders.has(sk.folder) && (!only.length || only.includes(sk.folder))) folders.set(sk.folder, sk.source);
+  const results = [];
+  let i = 0;
+  for (const [folder] of folders) {
+    progress(5 + (90 * i) / folders.size, `Atualizando ${folder} (${i + 1} de ${folders.size})`, 5 + (90 * ++i) / folders.size);
+    try { results.push(await updateSkill({ skill: folder, force: Boolean(body.force) })); }
+    catch (e) { results.push({ skill: folder, error: e.message, updated: [], unchanged: [], modified: [], local: [] }); }
+  }
+  return { results, updated: results.filter((r) => r.updated.length).map((r) => r.skill), modified: results.filter((r) => r.modified.length).map((r) => r.skill), failed: results.filter((r) => r.error).map((r) => `${r.skill}: ${r.error}`) };
 }
 
 function copySkill(body) {
@@ -1567,6 +1831,7 @@ async function installSkills(body) {
   const chosen = src.skills.filter((sk) => wanted.has(sk.folder));
   if (!chosen.length) throw new Error('escolha pelo menos uma skill');
   let done = 0;
+  const local = [], npmDone = new Set();
   for (const sk of chosen) {
     if (!SKILL_NAME_RE.test(sk.folder)) throw new Error(`nome de skill inválido: ${sk.folder}`);
     for (const t of targets) {
@@ -1574,10 +1839,12 @@ async function installSkills(body) {
       progress(55 + (40 * done) / total, `Instalando ${sk.folder} em ${t.display} (${done + 1} de ${total})`, 55 + (40 * ++done) / total);
       // a cópia é síncrona: cede a vez para a interface conseguir ler o progresso
       await new Promise((res) => setImmediate(res));
-      replaceSkillDir(sk.dir, path.join(t.dir, sk.folder), `${src.label}\n${src.commit} · ${src.date}\n`, true);
+      const at = replaceSkillDir(sk.dir, path.join(t.dir, sk.folder), `${src.stored}\n${src.commit} · ${src.date}\n`, true);
+      if (!npmDone.has(at)) { npmDone.add(at); local.push(...(await npmLocal(at, sk.folder))); }
     }
   }
-  return { installed: chosen.map((sk) => sk.folder), targets: targets.map((t) => t.display), commit: src.commit, date: src.date };
+  skillsCheckCache = null;
+  return { installed: chosen.map((sk) => sk.folder), targets: targets.map((t) => t.display), commit: src.commit, date: src.date, source: src.stored, local };
 }
 
 function removeSkill(body) {
@@ -3452,6 +3719,7 @@ const OP_FIRST_STAGE = {
   'POST /api/instructions/remove': ['Removendo a instrução', 80],
   'POST /api/skills/deps': ['Conferindo as dependências da skill', 95],
   'POST /api/skills/copy': ['Copiando a skill', 80],
+  'POST /api/skills/check': ['Conferindo se há versão nova das skills', 95],
   'POST /api/skills/remove': ['Removendo a skill', 80],
 };
 
@@ -3646,10 +3914,10 @@ const server = http.createServer(async (req, res) => {
         return '';
       };
       const firstSkill = src.skills.find((x) => folders.includes(x.folder));
-      return send(res, 200, { source: src.label, commit: src.commit, date: src.date, checkedAt: new Date().toISOString(),
+      return send(res, 200, { source: src.label, ref: src.ref, branch: src.branch, commit: src.commit, date: src.date, checkedAt: new Date().toISOString(),
         license: firstSkill ? licenseOf(firstSkill.dir) : '',
         readme: folders.length ? readmeExcerpt(src, folders) : null,
-        skills: src.skills.map(({ name, description, folder, files, license, compatibility }) => ({ name, description, folder, files, license: license || '', compatibility: compatibility || '' })) });
+        skills: src.skills.map(({ name, description, folder, files, license, compatibility, path: where, also }) => ({ name, description, folder, files, license: license || '', compatibility: compatibility || '', path: where || '', also: also || [] })) });
     }
     if (req.method === 'POST' && url.pathname === '/api/skills/install') {
       const body = await readBody(req);
@@ -3663,6 +3931,17 @@ const server = http.createServer(async (req, res) => {
       const r = await updateSkill(body);
       if (TTY) event('ok', r.updated.length ? `skill ${C.bold(r.skill)} atualizada ${C.gray(`(${r.commit})`)}` : `skill ${C.bold(r.skill)} já está na versão mais recente`);
       return send(res, 200, { ...(await state()), lastUpdate: r });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/skills/check') {
+      const body = await readBody(req);
+      return send(res, 200, await skillsCheck({ fresh: Boolean(body.fresh) }));
+    }
+    if (req.method === 'POST' && url.pathname === '/api/skills/update-all') {
+      const body = await readBody(req);
+      if (TTY) event('wait', 'atualizando as skills instaladas…');
+      const r = await updateAllSkills(body);
+      if (TTY) event(r.failed.length ? 'bad' : 'ok', r.updated.length ? `skills atualizadas: ${C.bold(r.updated.join(', '))}` : 'skills já estavam na versão mais recente');
+      return send(res, 200, { ...(await state()), lastUpdateAll: r });
     }
     if (req.method === 'POST' && url.pathname === '/api/skills/copy') {
       const body = await readBody(req);
@@ -3799,7 +4078,7 @@ if (require.main !== module) {
     awsProfiles, iniSections, AWS_CONFIG, AWS_CREDENTIALS,
     loginStatus, codexLogin, geminiLogin, copilotLogin, claudeRelogin, detectAccounts,
     skillTargets, skillMeta, fetchSource, parseSource, installSkills, updateSkill, copySkill, removeSkill, checkDeps, installDeps, readSkillLock,
-    inferDeps, depsFor, catalogItemOf, codeLines,
+    inferDeps, depsFor, catalogItemOf, codeLines, skillsCheck, updateAllSkills, dirHash, sourceRef, npmLocal,
     bedrockCheck, bedrockApply, modelsCheck, modelsApply, MODEL_SOURCES, toolInventory, versions, installed,
     instrTargets, instructionsState, saveInstruction, removeInstruction, scanGarbage, cleanGarbage,
     dropSources: () => { for (const entry of [...sourceCache.values(), ...retired]) dropSource(entry); sourceCache.clear(); retired.clear(); },

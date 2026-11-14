@@ -948,7 +948,10 @@
           <h2 id="h-skills"><svg class="h-ic" aria-hidden="true"><use href="#i-puzzle"/></svg>Skills <span class="count" id="skills-count">0</span></h2>
           <p>Instruções extras (formato <code>SKILL.md</code>) que os agentes carregam sozinhos. Instale uma vez em várias contas.</p>
         </div>
-        <button class="btn sm" id="btn-skill"><svg class="i"><use href="#i-plus"/></svg>Adicionar skill</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
+          <button class="btn sm" id="btn-skills-update" hidden title="Baixa a versão mais recente das skills que têm novidade no GitHub"></button>
+          <button class="btn sm" id="btn-skill"><svg class="i"><use href="#i-plus"/></svg>Adicionar skill</button>
+        </div>
       </div>
       <div id="skills" class="list"></div>
       <details class="suggest" id="suggest">
@@ -1996,7 +1999,7 @@ const depLine = (d) => {
   return `<li class="dep ${d.ok ? 'ok' : d.optional ? 'opt' : 'miss'}"><span class="mark">${d.ok ? icon('check') : d.optional ? '○' : icon('x')}</span>
     <span><b>${esc(d.label)}</b> <span class="none">(${esc(d.why || '')})</span>${how ? ` <span class="tag ${NEEDS_TERMINAL.includes(d.how) ? 'warn' : ''}">${how}</span>` : ''}</span></li>`;
 };
-const cmdBox = (cmd) => `<div class="cmd"><code style="white-space:normal">${esc(cmd)}</code><button type="button" class="btn ghost sm icon" data-copy="${esc(cmd)}" aria-label="Copiar comando" title="Copiar">${icon('copy')}</button></div>`;
+const cmdBox = (cmd) => `<div class="cmd"><code style="white-space:pre-wrap">${esc(cmd)}</code><button type="button" class="btn ghost sm icon" data-copy="${esc(cmd)}" aria-label="Copiar comando" title="Copiar">${icon('copy')}</button></div>`;
 // Passos que o SKILL.md pede e o hub não executa sozinho (comandos de setup, variáveis de ambiente).
 function stepsBlock(r) {
   const steps = Array.isArray(r.steps) ? r.steps : [];
@@ -2004,8 +2007,12 @@ function stepsBlock(r) {
   if (!steps.length && !compat.length) return '';
   const many = new Set(steps.map((s) => s.skill)).size > 1;
   return `${compat.map(([f, t]) => `<p class="hint" style="margin:0"><b>${compat.length > 1 ? `${esc(f)}: ` : ''}Compatibilidade declarada no SKILL.md:</b> ${esc(t)}</p>`).join('')}
-    ${steps.length ? `<div class="field"><span class="label">Depois de instalar <span class="none">· o SKILL.md pede; o hub não faz sozinho</span></span>
-      <ul class="deps">${steps.map((s) => `<li class="dep opt"><span class="mark">·</span><span><b>${many && s.skill ? `${esc(s.skill)}: ` : ''}${esc(s.title)}</b>${s.detail ? ` <span class="none">(${esc(s.detail)})</span>` : ''}${s.cmd ? `<br><code>${esc(s.cmd)}</code>` : ''}</span></li>`).join('')}</ul></div>` : ''}`;
+    ${(() => {
+      const li = (st) => `<li class="dep opt"><span class="mark">·</span><span><b>${many && st.skill ? `${esc(st.skill)}: ` : ''}${esc(st.title)}</b>${st.detail ? ` <span class="none">(${esc(st.detail)})</span>` : ''}${st.cmd ? `<br><code>${esc(st.cmd)}</code>` : ''}</span></li>`;
+      const auto = steps.filter((st) => st.kind === 'auto'), manual = steps.filter((st) => st.kind !== 'auto');
+      return `${auto.length ? `<div class="field"><span class="label">Ao instalar <span class="none">· o hub faz sozinho</span></span><ul class="deps">${auto.map(li).join('')}</ul></div>` : ''}
+        ${manual.length ? `<div class="field"><span class="label">Depois de instalar <span class="none">· o SKILL.md pede; o hub não faz sozinho</span></span><ul class="deps">${manual.map(li).join('')}</ul></div>` : ''}`;
+    })()}`;
 }
 function depsBlock(r, { intro = true } = {}) {
   const inferredOnly = Object.values(r.origin || {}).includes('inferida');
@@ -2141,6 +2148,12 @@ function renderSkills() {
     bySkill.set(sk.folder, e);
   }
   $('#skills-count').textContent = bySkill.size;
+  const pending = Object.entries((skillNews && skillNews.skills) || {}).filter(([k, v]) => v.update && bySkill.has(k)).length;
+  $('#btn-skills-update').hidden = !pending;
+  $('#btn-skills-update').disabled = false;
+  delete $('#btn-skills-update').dataset.label;
+  $('#btn-skills-update').innerHTML = `${icon('refresh')}${pending === 1 ? 'Atualizar 1 skill' : `Atualizar ${pending} skills`}`;
+  if ([...bySkill.values()].some((x) => x.source)) loadSkillNews();
   renderCatalog(new Set(bySkill.keys()));
   if (!targets.length) {
     box.innerHTML = '<div class="empty-row">Cadastre uma conta primeiro: as skills são instaladas nas pastas das suas contas.</div>';
@@ -2154,10 +2167,12 @@ function renderSkills() {
   box.innerHTML = [...bySkill.values()].map((sk) => {
     const missingIn = allTargets - sk.targets.length;
     const origin = sk.source ? `${esc(sk.source)}${sk.origin === 'npx skills' ? ' · via npx skills' : ''}${sk.version ? ` · ${esc(sk.version)}` : ''}` : 'origem desconhecida';
+    const news = skillNews && skillNews.skills && skillNews.skills[sk.folder];
+    const newTag = news && news.update ? ` <span class="tag warn" title="O repositório ${esc(news.source)} mudou desde a versão instalada (${esc(news.current)} → ${esc(news.latest)}). O Atualizar confere se esta skill mudou.">nova versão no GitHub</span>` : '';
     return `<div class="row skill-row" data-action="skill-info" data-skill="${esc(sk.folder)}" tabindex="0" role="button" aria-label="Detalhes de ${esc(sk.folder)}">
       <div class="row-icon skill-logo ${skillLogo(sk.source).cls}" aria-hidden="true"><svg><use href="#${esc(skillLogo(sk.source).id)}"/></svg></div>
       <div class="grow">
-        <strong class="mono">${esc(sk.folder)}</strong> <span class="none" style="font-size:12.5px">· ${origin}</span>
+        <strong class="mono">${esc(sk.folder)}</strong> <span class="none" style="font-size:12.5px">· ${origin}</span>${newTag}
         <div class="skill-desc one">${esc(shortSummary(sk))}</div>
         <div class="skill-where">${sk.targets.map((t) => `<span class="where" title="${esc(t.display)}"><span class="dot"><svg><use href="#${esc(toolMeta(t.tool).logo)}"/></svg></span>${esc(targetLabel(t))}</span>`).join('')}</div>
       </div>
@@ -2197,7 +2212,7 @@ async function refreshSkillDeps() {
   if (!skills.length) { box.innerHTML = ''; skillDeps = null; return; }
   box.innerHTML = '<p class="hint"><span class="spin"></span> conferindo dependências na sua máquina…</p>';
   try {
-    const r = await api('POST', '/api/skills/deps', { skills, source: skillPreview?.source || '' });
+    const r = await api('POST', '/api/skills/deps', { skills, source: skillPreview?.ref || skillPreview?.source || '' });
     if (tok !== depsSeq) return;
     skillDeps = r;
     box.innerHTML = `<span class="label">Dependências na sua máquina</span>${depsBlock(skillDeps)}`;
@@ -2219,11 +2234,11 @@ async function findSkills() {
     const all = skillPreview.skills;
     const shown = skillOnly ? all.filter((sk) => skillOnly.includes(sk.folder)) : all;
     $('#sk-found').innerHTML = `
-      <p class="hint">Versão no GitHub: <code>${esc(skillPreview.commit)}</code> · ${esc(skillPreview.date)}, verificado agora, às ${timeNow()}.</p>
+      <p class="hint">Versão no GitHub: <code>${esc(skillPreview.commit)}</code> · ${esc(skillPreview.date)}${skillPreview.branch ? ` · branch <code>${esc(skillPreview.branch)}</code> (as atualizações seguem essa branch)` : ''}, verificado agora, às ${timeNow()}.</p>
       <div class="field"><span class="label">${skillOnly ? 'Skill' + (shown.length > 1 ? 's' : '') : 'Skills encontradas'} em ${esc(skillPreview.source)}</span>
         <div class="check-list">${shown.map((sk) => `<label class="check">
           <input type="checkbox" name="sk-skill" value="${esc(sk.folder)}" checked>
-          <span><strong class="mono">${esc(sk.folder)}</strong> <span class="none">· ${plural(sk.files, 'arquivo')}${sk.license ? ` · ${esc(sk.license)}` : ''}</span>${sk.description ? `<br><span class="sub">${esc(sk.description.slice(0, 180))}${sk.description.length > 180 ? '…' : ''}</span>` : ''}${sk.compatibility ? `<br><span class="sub"><b>Compatibilidade:</b> ${esc(sk.compatibility.slice(0, 200))}</span>` : ''}</span></label>`).join('')}</div>
+          <span><strong class="mono">${esc(sk.folder)}</strong> <span class="none">· ${plural(sk.files, 'arquivo')}${sk.license ? ` · ${esc(sk.license)}` : ''}</span>${sk.description ? `<br><span class="sub">${esc(sk.description.slice(0, 180))}${sk.description.length > 180 ? '…' : ''}</span>` : ''}${sk.compatibility ? `<br><span class="sub"><b>Compatibilidade:</b> ${esc(sk.compatibility.slice(0, 200))}</span>` : ''}${sk.also && sk.also.length ? `<br><span class="sub">Vem de <code>${esc(sk.path)}</code>. O repositório tem outra pasta com o mesmo nome (${sk.also.map((x) => `<code>${esc(x)}</code>`).join(', ')}): para instalar aquela, cole o link dela.</span>` : ''}</span></label>`).join('')}</div>
         ${skillPreview.license || skillPreview.readme ? `<p class="hint" style="margin:6px 0 0">${skillPreview.license ? `Licença do repositório: <b>${esc(skillPreview.license)}</b>. ` : ''}${skillPreview.readme ? `<details class="adv more" style="display:inline"><summary style="display:inline">${icon('chev')}Ler o README (${esc(skillPreview.readme.from)})</summary><div class="inner"><pre class="readme">${esc(skillPreview.readme.text)}</pre></div></details>` : ''}</p>` : ''}
         ${skillOnly && all.length > shown.length ? `<p class="hint">Este repositório tem ${all.length} skills. <button type="button" class="linklike" id="sk-showall">Ver todas</button></p>` : ''}</div>
       <div class="field" id="sk-deps"></div>
@@ -2269,7 +2284,7 @@ async function runSkillInstall(skills, targets) {
   steps[0].state = 'run'; show();
   let deps;
   try {
-    deps = await api('POST', '/api/skills/deps', { skills, source: skillPreview?.source || '' });
+    deps = await api('POST', '/api/skills/deps', { skills, source: skillPreview?.ref || skillPreview?.source || '' });
   } catch (err) {
     steps[0].state = 'bad'; steps[0].detail = esc(err.message);
     show();
@@ -2283,7 +2298,7 @@ async function runSkillInstall(skills, targets) {
   if (missingAuto.length) {
     steps[1].state = 'run'; steps[1].detail = esc(missingAuto.map((d) => d.label).join(', ')); show();
     try {
-      deps = await api('POST', '/api/skills/deps/install', { skills, source: skillPreview?.source || '' });
+      deps = await api('POST', '/api/skills/deps/install', { skills, source: skillPreview?.ref || skillPreview?.source || '' });
       const failed = deps.log.filter((l) => /falhou/.test(l));
       steps[1].state = failed.length ? 'bad' : 'ok';
       steps[1].detail = esc(deps.log.join(' · ') || 'nada a fazer');
@@ -2296,10 +2311,11 @@ async function runSkillInstall(skills, targets) {
   steps[2].state = 'run'; show();
   let result = null;
   try {
-    state = await api('POST', '/api/skills/install', { source: skillPreview.source, skills, targets });
+    state = await api('POST', '/api/skills/install', { source: skillPreview.ref || skillPreview.source, skills, targets });
     result = state.lastInstall;
     steps[2].state = 'ok';
-    steps[2].detail = `versão <code>${esc(result.commit)}</code> · ${esc(result.date)} em ${result.targets.length} conta(s)`;
+    steps[2].detail = `versão <code>${esc(result.commit)}</code> · ${esc(result.date)} em ${result.targets.length} conta(s)${(result.local || []).map((l) => `<br>${esc(l)}`).join('')}`;
+    if ((result.local || []).some((l) => /falhou|não está instalado/.test(l))) steps[2].state = 'bad';
     render();
   } catch (err) { steps[2].state = 'bad'; steps[2].detail = esc(err.message); }
 
@@ -2330,21 +2346,69 @@ async function skillAction(btn) {
   return updateSkillNow(folder, source, btn);
 }
 
+// Skill editada na máquina depois de instalada: o servidor não sobrescreve sem confirmação (modified).
+async function updateSkillCall(folder, source) {
+  state = await api('POST', '/api/skills/update', { skill: folder, source });
+  let r = state.lastUpdate;
+  if (r.modified && r.modified.length) {
+    const ok = await confirmDialog('Sobrescrever as suas mudanças?', `<b>${esc(folder)}</b> foi editada nesta máquina depois de instalada (${r.modified.map((d) => `<code>${esc(d)}</code>`).join(', ')}). Atualizar troca a pasta inteira pela versão <code>${esc(r.commit)}</code> do GitHub e as suas mudanças se perdem.`);
+    if (ok) {
+      state = await api('POST', '/api/skills/update', { skill: folder, source, force: true });
+      r = state.lastUpdate;
+    } else r = { ...r, kept: true };
+  }
+  skillNews = null;
+  return r;
+}
+const updateToast = (r) => {
+  const extra = (r.local || []).length ? ` · ${r.local.join(' · ')}` : '';
+  if (r.kept) return toast(`${r.skill} não foi alterada: as suas mudanças continuam`, 'info');
+  toast(r.updated.length
+    ? `${r.skill} atualizada para ${r.commit} (${r.date}) em ${r.updated.length} pasta(s)${extra}`
+    : `${r.skill} já está na versão mais recente (${r.commit}, verificado agora)`, r.updated.length ? 'ok' : 'info');
+};
 async function updateSkillNow(folder, source, btn) {
   if (btn) setBusy(btn, true, 'Verificando…');
   try {
-    state = await api('POST', '/api/skills/update', { skill: folder, source });
-    const r = state.lastUpdate;
+    const r = await updateSkillCall(folder, source);
     render();
-    toast(r.updated.length
-      ? `${folder} atualizada para ${r.commit} (${r.date}) em ${r.updated.length} pasta(s)`
-      : `${folder} já está na versão mais recente (${r.commit}, verificado agora)`, r.updated.length ? 'ok' : 'info');
+    updateToast(r);
     return true;
   } catch (err) {
     toast(`Não atualizei ${folder}: ${err.message}. A versão instalada continua intacta.`, 'bad');
     if (btn) setBusy(btn, false);
     return false;
   }
+}
+
+// Novidades das skills instaladas: uma consulta leve por repositório, em segundo plano, no máximo a cada 10 min.
+let skillNews = null, skillNewsAt = 0, skillNewsBusy = false;
+async function loadSkillNews(fresh = false) {
+  if (skillNewsBusy || (!fresh && skillNews && Date.now() - skillNewsAt < 10 * 60 * 1000)) return;
+  skillNewsBusy = true;
+  try {
+    skillNews = await api('POST', '/api/skills/check', { fresh }, { quiet: true });
+    skillNewsAt = Date.now();
+    renderSkills();
+  } catch {} finally { skillNewsBusy = false; }
+}
+async function updateAllSkillsNow(btn) {
+  const todo = Object.entries((skillNews && skillNews.skills) || {}).filter(([, v]) => v.update).map(([k]) => k);
+  if (!todo.length) return;
+  setBusy(btn, true, 'Atualizando…');
+  try {
+    state = await api('POST', '/api/skills/update-all', { skills: todo });
+    const r = state.lastUpdateAll;
+    skillNews = null;
+    render();
+    const parts = [];
+    if (r.updated.length) parts.push(`atualizadas: ${r.updated.join(', ')}`);
+    const same = r.results.filter((x) => !x.error && !x.updated.length && !x.modified.length).length;
+    if (same) parts.push(`${same} já estava(m) na versão mais recente`);
+    if (r.modified.length) parts.push(`editadas por você, não mexi: ${r.modified.join(', ')} (use o Atualizar de cada uma)`);
+    if (r.failed.length) parts.push(`falharam: ${r.failed.join(' · ')}`);
+    toast(parts.join(' · ') || 'Nada a atualizar', r.failed.length ? 'bad' : r.updated.length ? 'ok' : 'info');
+  } catch (err) { toast(err.message, 'bad'); setBusy(btn, false); }
 }
 
 function openCopy(folder) {
@@ -3236,7 +3300,9 @@ function renderBedrock(a, r, applied = null) {
 }
 
 let garbage = null, garbageSeq = 0;
-const GARBAGE_LOGO = { claude: 'logo-claude', codex: 'logo-openai', gemini: 'logo-gemini', copilot: 'logo-copilot', agy: 'logo-antigravity', hub: 'i-trash' };
+const GARBAGE_LOGO = { claude: 'logo-claude', codex: 'logo-openai', gemini: 'logo-gemini', copilot: 'logo-copilot', agy: 'logo-antigravity', aws: 'logo-aws', hub: 'i-trash' };
+// ferramenta nova no servidor sem logo aqui: mostra o ícone genérico em vez de um quadro vazio
+const garbageLogo = (tool) => GARBAGE_LOGO[tool] || 'i-terminal';
 async function loadGarbage() {
   const tok = ++garbageSeq;
   $('#garbage').setAttribute('aria-busy', 'true');
@@ -3264,7 +3330,7 @@ function renderGarbage() {
     const sudo = t.items.filter((i) => i.kind === 'sudo').length;
     const shown = t.items.slice(0, 4);
     return `<article class="gcard">
-      <div class="gcard-head"><span class="avatar" aria-hidden="true"><svg><use href="#${esc(GARBAGE_LOGO[t.tool])}"/></svg></span>
+      <div class="gcard-head"><span class="avatar" aria-hidden="true"><svg><use href="#${esc(garbageLogo(t.tool))}"/></svg></span>
         <div class="grow"><strong>${esc(t.title)}</strong><span class="total"><b>${fmtSize(t.total)}</b> em ${t.items.length} ${t.items.length === 1 ? 'item' : 'itens'}</span></div></div>
       <ul class="gitems">${shown.map((i) => `<li><span class="dot"></span><span class="gw" title="${esc(`${i.why} · ${i.display}`)}">${esc(itemLine(i))}</span><span class="gs">${fmtSize(i.size)}</span></li>`).join('')}
         ${t.items.length > shown.length ? `<li class="more">+ ${t.items.length - shown.length} ${t.items.length - shown.length === 1 ? 'item' : 'itens'}</li>` : ''}</ul>
@@ -3279,7 +3345,7 @@ function renderGarbage() {
 function openGarbage(toolId) {
   const t = garbage?.tools.find((x) => x.tool === toolId);
   if (!t) return;
-  $('#gb-avatar').innerHTML = `<svg><use href="#${esc(GARBAGE_LOGO[t.tool])}"/></svg><span class="rm-badge"><svg><use href="#i-trash"/></svg></span>`;
+  $('#gb-avatar').innerHTML = `<svg><use href="#${esc(garbageLogo(t.tool))}"/></svg><span class="rm-badge"><svg><use href="#i-trash"/></svg></span>`;
   $('#gb-title').textContent = `Limpar o lixo do ${t.title}?`;
   $('#gb-sub').textContent = t.tool === 'hub' ? 'Sobras do próprio hub. Nada disso afeta suas contas ou skills.' : 'Nada disso afeta login, configurações, skills ou conversas recentes.';
   const item = (i) => {
@@ -3646,12 +3712,13 @@ $('#form-src').addEventListener('submit', async (e) => {
   setBusy(btn, true, 'Verificando…');
   $('#src-error').textContent = '';
   try {
-    state = await api('POST', '/api/skills/update', { skill: btn.dataset.skill, source: src });
-    const r = state.lastUpdate;
+    const r = await updateSkillCall(btn.dataset.skill, src);
     render(); $('#dlg-src').close();
-    toast(r.updated.length ? `${r.skill} atualizada para ${r.commit}` : `${r.skill} já está na versão mais recente (origem memorizada)`, r.updated.length ? 'ok' : 'info');
+    if (r.kept) updateToast(r);
+    else toast(r.updated.length ? `${r.skill} atualizada para ${r.commit}` : `${r.skill} já está na versão mais recente (origem memorizada)`, r.updated.length ? 'ok' : 'info');
   } catch (err) { $('#src-error').textContent = err.message; } finally { setBusy(btn, false); }
 });
+$('#btn-skills-update').addEventListener('click', (e) => updateAllSkillsNow(e.currentTarget));
 $('#form-skill').addEventListener('click', (e) => {
   const ex = e.target.closest('[data-example]');
   if (ex) { $('#sk-src').value = ex.dataset.example; findSkills(); }

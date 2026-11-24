@@ -2018,7 +2018,7 @@ function depsBlock(r, { intro = true } = {}) {
   const inferredOnly = Object.values(r.origin || {}).includes('inferida');
   if (!r.deps.length) return `<p class="hint">${inferredOnly ? 'Nenhuma dependência encontrada nos arquivos da skill (manifestos, scripts e SKILL.md).' : 'Não precisa de nenhum programa ou pacote extra.'}</p>${stepsBlock(r)}`;
   const plan = [];
-  if (r.inferred) plan.push('<p class="hint" style="margin:0">Dependências deduzidas dos arquivos da própria skill: manifestos, imports dos scripts e comandos citados no SKILL.md. Confira a evidência ao lado de cada uma.</p>');
+  if (r.inferred) plan.push('<p class="hint" style="margin:0">Dependências deduzidas dos arquivos da própria skill: manifestos, imports dos scripts, comandos citados no SKILL.md e o pacote de que ela faz parte. Confira a evidência ao lado de cada uma.</p>');
   if (r.allOk) plan.push(`<p class="ok-text" style="margin:0">${icon('check')} Tudo pronto na sua máquina.</p>`);
   else {
     if (r.auto.length) plan.push(`<p class="hint" style="margin:0">Antes da skill, o hub instala sozinho (sem sudo${r.deps.some((d) => !d.ok && d.how === 'brew') ? ', pelo Homebrew' : ''}): <b>${esc(r.auto.join(', '))}</b>.</p>`);
@@ -2238,7 +2238,7 @@ async function findSkills() {
       <div class="field"><span class="label">${skillOnly ? 'Skill' + (shown.length > 1 ? 's' : '') : 'Skills encontradas'} em ${esc(skillPreview.source)}</span>
         <div class="check-list">${shown.map((sk) => `<label class="check">
           <input type="checkbox" name="sk-skill" value="${esc(sk.folder)}" checked>
-          <span><strong class="mono">${esc(sk.folder)}</strong> <span class="none">· ${plural(sk.files, 'arquivo')}${sk.license ? ` · ${esc(sk.license)}` : ''}</span>${sk.description ? `<br><span class="sub">${esc(sk.description.slice(0, 180))}${sk.description.length > 180 ? '…' : ''}</span>` : ''}${sk.compatibility ? `<br><span class="sub"><b>Compatibilidade:</b> ${esc(sk.compatibility.slice(0, 200))}</span>` : ''}${sk.also && sk.also.length ? `<br><span class="sub">Vem de <code>${esc(sk.path)}</code>. O repositório tem outra pasta com o mesmo nome (${sk.also.map((x) => `<code>${esc(x)}</code>`).join(', ')}): para instalar aquela, cole o link dela.</span>` : ''}</span></label>`).join('')}</div>
+          <span><strong class="mono">${esc(sk.folder)}</strong> <span class="none">· ${plural(sk.files, 'arquivo')}${sk.license ? ` · ${esc(sk.license)}` : ''}</span>${sk.description ? `<br><span class="sub">${esc(sk.description.slice(0, 180))}${sk.description.length > 180 ? '…' : ''}</span>` : ''}${sk.compatibility ? `<br><span class="sub"><b>Compatibilidade:</b> ${esc(sk.compatibility.slice(0, 200))}</span>` : ''}${sk.note ? `<br><span class="sub">${esc(sk.note.charAt(0).toUpperCase() + sk.note.slice(1))}.</span>` : ''}${sk.also && sk.also.length ? `<br><span class="sub">Vem de <code>${esc(sk.path)}</code>. O repositório tem outra pasta com o mesmo nome (${sk.also.map((x) => `<code>${esc(x)}</code>`).join(', ')}): para instalar aquela, cole o link dela.</span>` : ''}</span></label>`).join('')}</div>
         ${skillPreview.license || skillPreview.readme ? `<p class="hint" style="margin:6px 0 0">${skillPreview.license ? `Licença do repositório: <b>${esc(skillPreview.license)}</b>. ` : ''}${skillPreview.readme ? `<details class="adv more" style="display:inline"><summary style="display:inline">${icon('chev')}Ler o README (${esc(skillPreview.readme.from)})</summary><div class="inner"><pre class="readme">${esc(skillPreview.readme.text)}</pre></div></details>` : ''}</p>` : ''}
         ${skillOnly && all.length > shown.length ? `<p class="hint">Este repositório tem ${all.length} skills. <button type="button" class="linklike" id="sk-showall">Ver todas</button></p>` : ''}</div>
       <div class="field" id="sk-deps"></div>
@@ -2291,7 +2291,7 @@ async function runSkillInstall(skills, targets) {
     $('#form-skill .dlg-foot').innerHTML = `<span class="error-summary" id="sk-error" role="alert"></span><button class="btn primary" type="button" data-close>Concluir</button>`;
     return toast('A instalação falhou', 'bad');
   }
-  const missingAuto = deps.deps.filter((d) => !d.ok && !d.optional && ['pip', 'npm', 'brew'].includes(d.how));
+  const missingAuto = deps.deps.filter((d) => !d.ok && !d.optional && ['pip', 'npm', 'brew', 'pytool'].includes(d.how));
   steps[0].state = 'ok';
   steps[0].detail = deps.deps.length ? `${deps.deps.filter((d) => d.ok).length} de ${deps.deps.length} já presentes` : 'nenhuma dependência extra';
 

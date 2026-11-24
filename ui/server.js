@@ -766,7 +766,10 @@ async function python() {
   }
   return (pyCmd = []);
 }
-const pyRun = async (args, timeout = 15000) => { const p = await python(); return p.length ? run(p[0], [...p.slice(1), ...args], timeout) : { ok: false, stdout: '', stderr: 'Python 3 não encontrado' }; };
+const pyRun = async (args, timeout = 15000, env) => { const p = await python(); return p.length ? run(p[0], [...p.slice(1), ...args], timeout, env) : { ok: false, stdout: '', stderr: 'Python 3 não encontrado' }; };
+// Script Python de várias linhas, com dados de entrada: os dois vão por variável de ambiente. No Windows, um python.bat
+// (pyenv-win) passa pelo cmd.exe, que não aceita quebra de linha nem JSON com aspas num argumento.
+const pyScript = (src, input = '', timeout = 15000) => pyRun(['-c', "import os;exec(os.environ['HUB_PY_SRC'])"], timeout, { HUB_PY_SRC: src, HUB_PY_IN: String(input) });
 
 // Windows: antivírus e indexador seguram arquivos por um instante.
 function retrying(fn) {
@@ -901,10 +904,21 @@ function readSkillLock() {
   try { return JSON.parse(fs.readFileSync(SKILL_LOCK, 'utf8')); } catch { return {}; }
 }
 
-function skillMeta(dir) {
-  const text = safeRead(path.join(dir, 'SKILL.md'));
+// Nome real do arquivo da skill numa pasta: SKILL.md, ou o mesmo nome em outra caixa (skill.md, Skill.md).
+// O nome vem da listagem da pasta: num sistema de arquivos que ignora a caixa (macOS, Windows), ler "SKILL.md"
+// acharia "skill.md" sem avisar, e a mesma skill sumiria no Linux.
+function skillFileOf(dir, names) {
+  let list = names;
+  if (!list) { try { list = fs.readdirSync(dir); } catch { return ''; } }
+  return list.includes('SKILL.md') ? 'SKILL.md' : list.find((n) => n.toLowerCase() === 'skill.md') || '';
+}
+const frontOf = (text) => (String(text).replace(/\r\n/g, '\n').match(/^---\s*\n([\s\S]*?)\n---/) || [])[1] || '';
+
+function skillMeta(dir, names) {
+  const file = skillFileOf(dir, names);
+  const text = file ? safeRead(path.join(dir, file)) : null;
   if (text == null) return null;
-  const fm = (text.replace(/\r\n/g, '\n').match(/^---\s*\n([\s\S]*?)\n---/) || [])[1] || '';
+  const fm = frontOf(text);
   const get = (k) => fmValue(fm, k);
   let source = '', version = '', origin = '';
   [source = '', version = ''] = (safeRead(path.join(dir, '.hub-source')) || '').trim().split('\n'); origin = source ? 'hub' : '';
@@ -958,7 +972,7 @@ function parseSource(src) {
   if (fromSkillsSh) { const seg = text.split('/').filter(Boolean); text = seg.slice(0, 2).join('/'); only = seg[2] || ''; }
   const m = text.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:\/(?:tree|blob)\/(.+?))?\/?$/);
   if (!m || m[1].startsWith('.') || m[2].startsWith('.')) throw bad();
-  const segs = (m[3] || '').replace(/\/?SKILL\.md$/, '').split('/').filter(Boolean);
+  const segs = (m[3] || '').replace(/\/?skill(?:[-_][a-z0-9-]+)?\.md$/i, '').split('/').filter(Boolean);
   if ([...segs, ...at.split('/')].some((x) => x === '..' || (x && !/^[A-Za-z0-9_.-]+$/.test(x)))) throw new Error('caminho inválido');
   if (only && !SKILL_NAME_RE.test(only)) only = '';
   // em /tree/a/b/c não dá para saber onde a branch termina: vale o primeiro trecho, e fetchSource confere no GitHub se falhar
@@ -978,7 +992,14 @@ async function resolveRef(url, refPath) {
   return null;
 }
 
-const dropSource = (entry) => { if (entry) fs.rmSync(entry.dir, { recursive: true, force: true }); };
+// Skills montadas pelo hub a partir de um clone (ver stageSkill): ficam numa pasta temporária irmã e saem junto com ele.
+const stages = new Map();
+const dropSource = (entry) => {
+  if (!entry) return;
+  fs.rmSync(entry.dir, { recursive: true, force: true });
+  const stage = stages.get(entry.dir);
+  if (stage) { stages.delete(entry.dir); fs.rmSync(stage.dir, { recursive: true, force: true }); }
+};
 // Outra requisição pode ainda estar lendo o clone antigo: apaga só depois.
 const retired = new Set();
 function retireSource(entry) {
@@ -988,31 +1009,161 @@ function retireSource(entry) {
 
 const sourceCache = new Map();
 const SKILL_DEPTH = 6;
-// Skills (pastas com SKILL.md) a partir de uma pasta do clone. A raiz do repositório só conta se for a única.
+// ---- Skills fora do formato "pasta com SKILL.md" ----
+// Dois casos, os dois reconhecidos pelo arquivo skill.md em outra caixa (sem um SKILL.md na mesma pasta):
+//   1. pasta comum de skill com o arquivo em minúsculas: a pasta vai inteira, e o arquivo vira SKILL.md;
+//   2. skill embutida num pacote de código (ex.: o pacote Python de uma ferramenta, com skill.md ao lado dos .py e
+//      uma variante por agente em skill-codex.md, skill-copilot.md…): a skill é só o arquivo e as pastas de apoio dele,
+//      nunca o código do pacote. Cada agente recebe a sua variante.
+const SKILL_TOOLS = ['claude', 'codex', 'gemini', 'antigravity', 'copilot', 'agents'];
+const VARIANT_ALIAS = { claude: ['claude-code'], gemini: ['gemini-cli'], antigravity: ['agy'], copilot: ['github-copilot'], agents: ['generic'] };
+// Pastas de apoio que um SKILL.md costuma citar e que podem estar ao lado do arquivo.
+const SIDE_DIRS = ['references', 'reference', 'scripts', 'assets', 'templates', 'resources', 'examples', 'prompts', 'rules', 'schemas'];
+const isDirReal = (p) => { try { return fs.lstatSync(p).isDirectory(); } catch { return false; } };
+const skillDirFor = (sk, tool) => (sk.variants && sk.variants[tool]) || sk.dir;
+
+function looseSkillAt(d, names) {
+  let list = names;
+  if (!list) { try { list = fs.readdirSync(d); } catch { return null; } }
+  if (list.includes('SKILL.md')) return null;
+  const base = list.find((n) => n.toLowerCase() === 'skill.md');
+  if (!base) return null;
+  const head = (f) => { const t = safeRead(path.join(d, f)); if (t == null) return null; const fm = frontOf(t); return { name: fmValue(fm, 'name'), description: fmValue(fm, 'description') }; };
+  const own = head(base);
+  if (!own) return null;
+  const variants = {};
+  for (const n of list) {
+    const m = n.match(/^skill[-_]([a-z0-9][a-z0-9-]{0,30})\.md$/i);
+    const v = m ? head(n) : null;
+    // variante de verdade repete o nome da skill no cabeçalho; skill-feedback.md, skill-template.md e afins são documentos
+    if (v && own.name && v.name === own.name) variants[m[1].toLowerCase()] = n;
+  }
+  const packaged = Object.keys(variants).length > 0 || list.includes('__init__.py');
+  // dentro de um pacote, um skill.md sem cabeçalho é só um documento do projeto
+  if (packaged && !own.name && !own.description) return null;
+  return { base, variants, packaged, name: own.name };
+}
+
+// Copia a pasta de uma skill. Links só podem apontar para dentro da própria skill: um repositório não alcança
+// arquivos do usuário. fromRepo: marcas do hub que vierem no repositório não entram.
+function copySkillTree(srcDir, dest, fromRepo = false) {
+  const filter = (f) => {
+    if (path.relative(srcDir, f).split(path.sep).includes('.git')) return false;
+    if (fromRepo && ['.hub-source', INSTR_SKILL_MARK].includes(path.basename(f))) return false;
+    let st;
+    try { st = fs.lstatSync(f); } catch { return false; }
+    return !st.isSymbolicLink() || linkStaysInside(srcDir, f);
+  };
+  try { fs.cpSync(srcDir, dest, { recursive: true, verbatimSymlinks: true, filter }); }
+  catch (e) {
+    // Windows sem modo de desenvolvedor não cria links: copia o conteúdo
+    if (e.code !== 'EPERM') throw e;
+    rmSafe(dest);
+    fs.cpSync(srcDir, dest, { recursive: true, dereference: true, filter });
+  }
+}
+
+// Monta, numa pasta temporária do clone, a skill como ela deve chegar ao agente (pasta com SKILL.md).
+function stageSkill(root, d, loose, folder) {
+  let stage = stages.get(root);
+  if (!stage) { stage = { dir: fs.mkdtempSync(path.join(os.tmpdir(), 'hub-skill-')), made: new Map(), seq: 0 }; stages.set(root, stage); }
+  const cached = stage.made.get(d);
+  if (cached) return cached;
+  const fresh = () => { const out = path.join(stage.dir, String(++stage.seq), folder); fs.mkdirSync(out, { recursive: true }); return out; };
+  const setFile = (out, text) => {
+    for (const n of fs.readdirSync(out)) if (n.toLowerCase() === 'skill.md') fs.rmSync(path.join(out, n), { recursive: true, force: true });
+    fs.writeFileSync(path.join(out, 'SKILL.md'), text);
+  };
+  let result;
+  if (!loose.packaged) {
+    const out = fresh();
+    copySkillTree(d, out, true);
+    setFile(out, safeRead(path.join(d, loose.base)) || '');
+    result = { dir: out, variants: {} };
+  } else {
+    const built = new Map();
+    const build = (tool) => {
+      const keys = [tool, ...(VARIANT_ALIAS[tool] || []), ...(IS_WIN ? ['windows'] : [])];
+      const key = keys.find((k) => loose.variants[k]) || '';
+      const file = key ? loose.variants[key] : loose.base;
+      // arquivos de apoio da variante: skills/<variante>/ ao lado do arquivo (ex.: skills/codex/references)
+      const bundle = [...new Set([key, ...keys, 'claude', 'default', 'common'])].filter(Boolean).map((k) => path.join(d, 'skills', k)).find(isDirReal) || '';
+      const id = `${file}\0${bundle}`;
+      if (built.has(id)) return built.get(id);
+      const out = fresh();
+      const text = safeRead(path.join(d, file)) || '';
+      if (bundle) copySkillTree(bundle, out, true);
+      // pastas de apoio citadas no texto que estão ao lado do arquivo (a variante tem prioridade)
+      for (const side of SIDE_DIRS) {
+        if (!new RegExp(`(^|[^\\w/.-])${side}/[\\w.-]`, 'm').test(text)) continue;
+        const from = path.join(d, side), to = path.join(out, side);
+        if (isDirReal(from) && !lexists(to)) copySkillTree(from, to, true);
+      }
+      setFile(out, text);
+      built.set(id, out);
+      return out;
+    };
+    const main = build('claude');
+    const variants = {};
+    for (const t of SKILL_TOOLS) { const v = build(t); if (v !== main) variants[t] = v; }
+    result = { dir: main, variants };
+  }
+  stage.made.set(d, result);
+  return result;
+}
+
+// Skill numa pasta do clone, se houver. Na raiz do repositório a pasta leva o nome declarado no arquivo
+// (é o que os agentes esperam), não o do repositório.
+function skillAt(root, d, repoName, names) {
+  let list = names;
+  if (!list) { try { list = fs.readdirSync(d); } catch { return null; } }
+  const named = (meta) => (d === root ? (SKILL_NAME_RE.test(meta.name) ? meta.name : repoName) : path.basename(d));
+  if (list.includes('SKILL.md')) {
+    const meta = skillMeta(d, list);
+    return meta ? { ...meta, dir: d, home: d, folder: named(meta) } : null;
+  }
+  const loose = looseSkillAt(d, list);
+  if (!loose) return null;
+  const folder = loose.packaged && SKILL_NAME_RE.test(loose.name) ? loose.name : named(loose);
+  if (!SKILL_NAME_RE.test(folder)) return null;
+  const staged = stageSkill(root, d, loose, folder);
+  const meta = skillMeta(staged.dir);
+  if (!meta) return null;
+  return { ...meta, dir: staged.dir, home: d, folder, file: loose.base, ...(loose.packaged ? { embedded: true, variants: staged.variants } : {}) };
+}
+
+// Skills a partir de uma pasta do clone. A raiz do repositório só conta se for a única.
 function findSkills(root, from, repoName) {
   const skills = [];
   const walk = (d, depth) => {
     if (depth > SKILL_DEPTH) return;
-    const meta = skillMeta(d);
-    if (meta && d !== root) { skills.push({ ...meta, dir: d, folder: path.basename(d) }); return; }
     let entries = [];
     try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    if (d !== root) { const sk = skillAt(root, d, repoName, entries.map((e) => e.name)); if (sk) { skills.push(sk); return; } }
     for (const e of entries) if (e.isDirectory() && !['.git', 'node_modules'].includes(e.name)) walk(path.join(d, e.name), depth + 1);
   };
   walk(from, 0);
-  if (!skills.length && from === root) {
-    const meta = skillMeta(root);
-    // skill na raiz: a pasta leva o nome declarado no SKILL.md (é o que os agentes esperam), não o do repositório
-    if (meta) skills.push({ ...meta, dir: root, folder: SKILL_NAME_RE.test(meta.name) ? meta.name : repoName });
-  }
+  if (!skills.length && from === root) { const sk = skillAt(root, root, repoName); if (sk) skills.push(sk); }
   return skills;
+}
+// Repositório sem nenhuma skill: diz o que ele é, quando dá para reconhecer, em vez de só "não achei".
+function noSkillHint(root) {
+  const has = (...p) => lexists(path.join(root, ...p));
+  const mdIn = (...p) => { try { return fs.readdirSync(path.join(root, ...p)).some((n) => /\.md$/i.test(n)); } catch { return false; } };
+  if (has('.claude-plugin')) return 'o repositório é um plugin do Claude Code sem skills dentro. Instale pelo /plugin do próprio Claude Code';
+  if (mdIn('commands') || mdIn('.claude', 'commands') || mdIn('agents') || mdIn('.claude', 'agents'))
+    return 'o repositório parece trazer comandos ou agentes (pastas commands/ ou agents/), que não são skills: o hub não instala esse formato';
+  if (has('gemini-extension.json')) return 'o repositório é uma extensão do Gemini CLI. Instale com gemini extensions install';
+  const proj = projectOf(root, root);
+  if (proj && proj.cited) return `o repositório é ${proj.type === 'py' ? 'um pacote Python' : 'um pacote Node'} (${proj.name}) sem skill dentro. O README manda instalar com: ${proj.cited.replace(/^README\.md: /, '')}`;
+  return '';
 }
 const countFiles = (d) => fs.readdirSync(d, { withFileTypes: true }).reduce((n, e) =>
   e.name === '.git' ? n : n + (e.isDirectory() ? countFiles(path.join(d, e.name)) : 1), 0);
 // Duas pastas com o mesmo nome no repositório (ex.: skills/.curated/x e skills/.system/x) iriam para o mesmo destino:
 // fica a que não está em pasta oculta, depois a mais rasa; as outras viram "also" (para escolher uma delas, use o link da pasta).
 function dedupeSkills(skills, root) {
-  const rank = (sk) => { const rel = path.relative(root, sk.dir).split(path.sep); return [rel.some((x) => x.startsWith('.')) ? 1 : 0, rel.length, rel.join('/')]; };
+  const rank = (sk) => { const rel = path.relative(root, sk.home || sk.dir).split(path.sep); return [rel.some((x) => x.startsWith('.')) ? 1 : 0, rel.length, rel.join('/')]; };
   const best = new Map();
   for (const sk of skills) {
     const cur = best.get(sk.folder);
@@ -1021,7 +1172,7 @@ function dedupeSkills(skills, root) {
     const wins = a[0] !== b[0] ? a[0] < b[0] : a[1] !== b[1] ? a[1] < b[1] : a[2] < b[2];
     const lost = wins ? cur : sk;
     const kept = wins ? { ...sk, also: cur.also } : cur;
-    kept.also.push(path.relative(root, lost.dir).split(path.sep).join('/'));
+    kept.also.push(path.relative(root, lost.home || lost.dir).split(path.sep).join('/'));
     best.set(sk.folder, kept);
   }
   return [...best.values()];
@@ -1036,12 +1187,19 @@ async function fetchSource(src, { fresh = false } = {}) {
       // pasta apontada pelo link mais funda que a busca geral: procura a partir dela
       const from = path.join(entry.dir, sub);
       if (insideDir(entry.dir, from) && fs.existsSync(from)) {
-        const own = skillMeta(from);
-        list = own ? [{ ...own, dir: from, folder: path.basename(from) }] : findSkills(entry.dir, from, label.split('/')[1]);
+        const own = fs.statSync(from).isDirectory() ? skillAt(entry.dir, from, label.split('/')[1]) : null;
+        list = own ? [own] : findSkills(entry.dir, from, label.split('/')[1]);
         for (const sk of list) { sk.files = countFiles(sk.dir); entry.skills.push(sk); }
       }
     }
-    list = dedupeSkills(list, entry.dir).map((sk) => ({ ...sk, path: path.relative(entry.dir, sk.dir).split(path.sep).join('/') }));
+    list = dedupeSkills(list, entry.dir).map((sk) => {
+      const where = path.relative(entry.dir, sk.home || sk.dir).split(path.sep).join('/');
+      const origin = `${where ? `${where}/` : ''}${sk.file || ''}`;
+      // skill montada pelo hub: diz de onde veio e o que entra, para ninguém estranhar a pasta menor que a do repositório
+      const note = sk.embedded ? `montada a partir de ${origin}: entram só o SKILL.md e os arquivos de apoio, não o código do pacote${Object.keys(sk.variants || {}).length ? '; cada agente recebe a variante dele' : ''}`
+        : sk.file ? `o arquivo ${origin} é instalado como SKILL.md, o nome que os agentes procuram` : '';
+      return { ...sk, path: where, note };
+    });
     if (only && list.some((sk) => sk.folder === only)) list = list.filter((sk) => sk.folder === only);
     if (!list.length) throw new Error(`nenhuma skill (SKILL.md) em ${label}${sub ? `/${sub}` : ''}`);
     // ref: o que a interface devolve nas próximas chamadas (mantém branch e pasta); stored: o que fica gravado na skill
@@ -1078,7 +1236,11 @@ async function fetchSource(src, { fresh = false } = {}) {
   if (cached) { retireSource(cached); sourceCache.delete(key); }
   progress(48, 'Lendo as skills do repositório', 54);
   const skills = findSkills(dir, dir, label.split('/')[1]);
-  if (!skills.length && !sub) { fs.rmSync(dir, { recursive: true, force: true }); throw new Error(`nenhuma skill (SKILL.md) encontrada em ${label}`); }
+  if (!skills.length && !sub) {
+    const hint = noSkillHint(dir);
+    dropSource({ dir });
+    throw new Error(`nenhuma skill (SKILL.md) encontrada em ${label}${hint ? `: ${hint}` : ''}`);
+  }
   for (const sk of skills) sk.files = countFiles(sk.dir);
   const head = await run('git', ['-C', dir, 'log', '-1', '--format=%h|%cd|%H', '--date=short']);
   const [commit = '', date = '', sha = ''] = head.stdout.split('|');
@@ -1090,7 +1252,7 @@ async function fetchSource(src, { fresh = false } = {}) {
 function filterSub(entry, sub) {
   if (!sub) return entry;
   const root = path.join(entry.dir, sub);
-  return { ...entry, skills: entry.skills.filter((sk) => sk.dir === root || sk.dir.startsWith(root + path.sep)) };
+  return { ...entry, skills: entry.skills.filter((sk) => { const at = sk.home || sk.dir; return at === root || at.startsWith(root + path.sep); }) };
 }
 
 // O trecho exibido tem até 1600 caracteres: cortar antes deixa as regex lineares em READMEs enormes.
@@ -1139,21 +1301,24 @@ const sysPkgOk = (p) => DEP_NAME_RE.test(p) && !p.endsWith('-');
 // Módulos da biblioteca padrão do Python (não são dependências).
 const PY_STDLIB = new Set(('__future__ _thread abc aifc argparse array ast asynchat asyncio asyncore atexit audioop base64 bdb binascii bisect builtins bz2 calendar cgi cgitb chunk cmath cmd code codecs codeop collections colorsys compileall concurrent configparser contextlib contextvars copy copyreg cProfile crypt csv ctypes curses dataclasses datetime dbm decimal difflib dis distutils doctest email encodings ensurepip enum errno faulthandler fcntl filecmp fileinput fnmatch fractions ftplib functools gc getopt getpass gettext glob graphlib grp gzip hashlib heapq hmac html http idlelib imaplib imghdr imp importlib inspect io ipaddress itertools json keyword lib2to3 linecache locale logging lzma mailbox mailcap marshal math mimetypes mmap modulefinder msilib msvcrt multiprocessing netrc nis nntplib numbers operator optparse os ossaudiodev pathlib pdb pickle pickletools pipes pkgutil platform plistlib poplib posix posixpath pprint profile pstats pty pwd py_compile pyclbr pydoc queue quopri random re readline reprlib resource rlcompleter runpy sched secrets select selectors shelve shlex shutil signal site smtpd smtplib sndhdr socket socketserver spwd sqlite3 ssl stat statistics string stringprep struct subprocess sunau symtable sys sysconfig syslog tabnanny tarfile telnetlib tempfile termios textwrap threading time timeit tkinter token tokenize tomllib trace traceback tracemalloc tty turtle turtledemo types typing typing_extensions unicodedata unittest urllib uu uuid venv warnings wave weakref webbrowser winreg winsound wsgiref xdrlib xml xmlrpc zipapp zipfile zipimport zlib zoneinfo ' +
   'setuptools pkg_resources pip wheel ntpath nt').split(' '));
+// Tabelas consultadas com palavras tiradas dos arquivos da skill: sem protótipo, para "constructor" ou "toString"
+// num SKILL.md não acharem as propriedades herdadas de Object.
+const table = (o) => Object.assign(Object.create(null), o);
 // Módulo importado → pacote no pip, quando os nomes diferem.
-const PY_IMPORT_PKG = {
+const PY_IMPORT_PKG = table({
   PIL: 'pillow', yaml: 'PyYAML', cv2: 'opencv-python', bs4: 'beautifulsoup4', sklearn: 'scikit-learn', skimage: 'scikit-image',
   docx: 'python-docx', pptx: 'python-pptx', dateutil: 'python-dateutil', dotenv: 'python-dotenv', jwt: 'PyJWT', Crypto: 'pycryptodome',
   nacl: 'pynacl', serial: 'pyserial', usb: 'pyusb', magic: 'python-magic', fitz: 'PyMuPDF', pymupdf: 'PyMuPDF', websocket: 'websocket-client',
   attr: 'attrs', OpenSSL: 'pyopenssl', psycopg2: 'psycopg2-binary', MySQLdb: 'mysqlclient', markdown: 'Markdown', pdfminer: 'pdfminer.six',
   wx: 'wxPython', gi: '', google: '', tests: '', test: '',
-};
-const PY_PKG_IMPORT = Object.fromEntries(Object.entries(PY_IMPORT_PKG).filter(([, v]) => v).map(([k, v]) => [v.toLowerCase(), k]));
+});
+const PY_PKG_IMPORT = table(Object.fromEntries(Object.entries(PY_IMPORT_PKG).filter(([, v]) => v).map(([k, v]) => [v.toLowerCase(), k])));
 // Pacote do sistema → programa que fica no PATH (para conferir se já está instalado).
-const PKG_BIN = {
+const PKG_BIN = table({
   poppler: 'pdftoppm', 'poppler-utils': 'pdftoppm', libreoffice: 'soffice', 'libreoffice-fresh': 'soffice', ripgrep: 'rg', imagemagick: 'magick',
   'tesseract-ocr': 'tesseract', graphviz: 'dot', nodejs: 'node', 'python3-pip': 'pip3', 'build-essential': 'gcc', coreutils: '', 'ca-certificates': '', 'libmagic1': '',
-};
-const PKG_LABEL = { pillow: 'Pillow', pyyaml: 'PyYAML' };
+});
+const PKG_LABEL = table({ pillow: 'Pillow', pyyaml: 'PyYAML' });
 // Programas que os scripts de skills costumam chamar: nome no PATH → como instalar em cada sistema.
 // Só entram na lista de uma skill quando aparecem nos arquivos dela (ver inferDeps).
 const KNOWN_BINS = {
@@ -1173,9 +1338,11 @@ const KNOWN_BINS = {
   sqlite3: { label: 'SQLite (sqlite3)', apt: 'sqlite3', dnf: 'sqlite', brew: 'sqlite', pacman: 'sqlite', apk: 'sqlite', winget: 'SQLite.SQLite', manual: 'https://sqlite.org/download.html' },
   'yt-dlp': { label: 'yt-dlp', apt: 'yt-dlp', brew: 'yt-dlp', pacman: 'yt-dlp', apk: 'yt-dlp', winget: 'yt-dlp.yt-dlp', manual: 'https://github.com/yt-dlp/yt-dlp#installation' },
   docker: { label: 'Docker', manual: 'https://docs.docker.com/get-docker/' },
+  uv: { label: 'uv', alias: ['uvx'], textOnly: true, brew: 'uv', pacman: 'uv', apk: 'uv', winget: 'astral-sh.uv', manual: 'https://docs.astral.sh/uv/getting-started/installation/' },
+  pipx: { label: 'pipx', textOnly: true, apt: 'pipx', dnf: 'pipx', brew: 'pipx', pacman: 'python-pipx', apk: 'pipx', manual: 'https://pipx.pypa.io/stable/installation/' },
 };
-const BIN_OF_ALIAS = Object.fromEntries(Object.entries(KNOWN_BINS).flatMap(([bin, d]) => [[bin, bin], ...(d.alias || []).map((x) => [x, bin])]));
-const BIN_WORD_RE = new RegExp(`(?<![\\w./-])(${Object.keys(BIN_OF_ALIAS).map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).sort((x, y) => y.length - x.length).join('|')})(?![\\w-])`, 'g');
+const BIN_OF_ALIAS = table(Object.fromEntries(Object.entries(KNOWN_BINS).flatMap(([bin, d]) => [[bin, bin], ...(d.alias || []).map((x) => [x, bin])])));
+const BIN_WORD_RE = new RegExp(`(?<![\\w./-])(${Object.keys(BIN_OF_ALIAS).filter((x) => !KNOWN_BINS[BIN_OF_ALIAS[x]].textOnly).map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).sort((x, y) => y.length - x.length).join('|')})(?![\\w-])`, 'g');
 // Especificação do pip com versão (pandas>=1.5,<3): vai inteira para o pip, que respeita o que a skill pede.
 const PIP_SPEC_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(\[[A-Za-z0-9_,.-]{1,64}\])?((==|>=|<=|~=|!=|>|<)[A-Za-z0-9.*+!_-]{1,32}(,(==|>=|<=|~=|!=|>|<)[A-Za-z0-9.*+!_-]{1,32}){0,3})?$/;
 const pipSpecOf = (spec) => { const t = String(spec).trim().replace(/^-e\s+/, '').replace(/\s*;.*$/, '').replace(/\s+/g, ''); return PIP_SPEC_RE.test(t) ? t : ''; };
@@ -1186,6 +1353,170 @@ const ENV_VAR_RE = /\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:API_KEY|TOKEN|SECRET|ACC
 const pipName = (spec) => String(spec).trim().replace(/^-e\s+/, '').replace(/\[.*$/, '').replace(/[<>=!~;@ ].*$/, '').replace(/\s.*$/, '').trim();
 const pipLabel = (pkg) => `Python: ${PKG_LABEL[pkg.toLowerCase()] || pkg}`;
 const importOf = (pkg) => PY_PKG_IMPORT[pkg.toLowerCase()] || pkg.toLowerCase().replace(/-/g, '_');
+
+const normPkg = (n) => String(n).toLowerCase().replace(/[-_.]+/g, '-');
+const verParts = (v) => String(v).split('.').map((x) => parseInt(x, 10) || 0);
+function verCmp(a, op, b) {
+  const wild = /\.\*$/.test(String(b));
+  const x = verParts(a), y = verParts(String(b).replace(/\.\*$/, ''));
+  let c = 0;
+  for (let i = 0; i < Math.max(x.length, y.length) && !c; i++) c = Math.sign((x[i] || 0) - (y[i] || 0));
+  if (op === '==') return wild ? y.every((n, i) => x[i] === n) : c === 0;
+  if (op === '!=') return wild ? !y.every((n, i) => x[i] === n) : c !== 0;
+  if (op === '~=') return c >= 0 && y.slice(0, -1).every((n, i) => x[i] === n);
+  return op === '>=' ? c >= 0 : op === '<=' ? c <= 0 : op === '>' ? c > 0 : c < 0;
+}
+// "requires-python" de um pacote (>=3.11.5,<3.15) contra a versão do Python. Sem um dos dois, não há o que recusar.
+const pyVersionOk = (ver, spec) => !spec || !ver || String(spec).split(',').map((x) => x.trim()).filter(Boolean)
+  .every((c) => { const m = c.match(/^(==|!=|>=|<=|~=|>|<)\s*([\d.*]+)$/); return m ? verCmp(ver, m[1], m[2]) : true; });
+// Marcador de ambiente do pip (o que vem depois do ";", ex.: python_version < '3.11'): true ou false quando dá para
+// decidir nesta máquina, null quando não dá.
+function markerOk(marker, pyVer) {
+  const text = String(marker || '').trim();
+  if (!text) return true;
+  const one = (expr) => {
+    const x = expr.trim().replace(/^\(+|\)+$/g, '').match(/^(\w+)\s*(==|!=|>=|<=|~=|>|<)\s*["']([^"']*)["']$/);
+    if (!x) return null;
+    const [, k, op, v] = x;
+    if (k === 'python_version' || k === 'python_full_version') return pyVer ? verCmp(k === 'python_version' ? pyVer.split('.').slice(0, 2).join('.') : pyVer, op, v) : null;
+    const cur = k === 'sys_platform' ? (IS_WIN ? 'win32' : IS_MAC ? 'darwin' : 'linux') : k === 'platform_system' ? (IS_WIN ? 'Windows' : IS_MAC ? 'Darwin' : 'Linux') : k === 'os_name' ? (IS_WIN ? 'nt' : 'posix') : null;
+    if (cur === null || !['==', '!='].includes(op)) return null;
+    return (cur === v) === (op === '==');
+  };
+  // "a and b or c" (sem parênteses aninhados): basta um grupo inteiro valer
+  let unknown = false;
+  for (const part of text.split(/\s+or\s+/)) {
+    const rs = part.split(/\s+and\s+/).map(one);
+    if (rs.every((r) => r === true)) return true;
+    if (!rs.includes(false)) unknown = true;
+  }
+  return unknown ? null : false;
+}
+// Strings de um array TOML a partir de "from" (dependencies = [ … ]): respeita aspas, colchetes dentro delas e comentários.
+function tomlStrings(text, from) {
+  const out = [];
+  let i = text.indexOf('[', from);
+  if (i < 0) return out;
+  for (i++; i < text.length && text[i] !== ']'; i++) {
+    const c = text[i];
+    if (c === '#') { while (i < text.length && text[i] !== '\n') i++; continue; }
+    if (c !== '"' && c !== "'") continue;
+    let j = i + 1, str = '';
+    while (j < text.length && text[j] !== c && text[j] !== '\n') { if (c === '"' && text[j] === '\\') j++; str += text[j] || ''; j++; }
+    out.push(str);
+    i = j;
+  }
+  return out;
+}
+// O que interessa de um pyproject.toml: nome no PyPI, Python pedido, comandos que o pacote instala e dependências.
+function pyProject(text) {
+  const t = String(text).replace(/\r\n/g, '\n');
+  const out = { name: '', requires: '', bins: [], deps: [], extras: [] };
+  let table = '', pos = 0;
+  for (const line of t.split('\n')) {
+    const at = pos;
+    pos += line.length + 1;
+    const h = line.match(/^\s*\[\[?\s*([A-Za-z0-9_."' -]+?)\s*\]\]?\s*(#.*)?$/);
+    if (h) { table = h[1].replace(/["'\s]/g, ''); continue; }
+    const kv = line.match(/^\s*("[^"]+"|'[^']+'|[A-Za-z0-9_.-]+)\s*=\s*(.*)$/);
+    if (!kv) continue;
+    const key = kv[1].replace(/^["']|["']$/g, ''), val = kv[2].trim();
+    const str = (val.match(/^["']([^"']*)["']/) || [])[1] || '';
+    const list = () => (val.startsWith('[') ? tomlStrings(t, at + line.indexOf('=')) : []);
+    if (table === 'project' || table === 'tool.poetry') {
+      if (key === 'name' && !out.name) out.name = str;
+      else if (key === 'requires-python') out.requires = str;
+      else if (key === 'dependencies') out.deps.push(...list());
+    } else if (table === 'project.scripts' || table === 'tool.poetry.scripts') out.bins.push(key);
+    else if (table === 'project.optional-dependencies' || table === 'dependency-groups') out.extras.push(...list());
+    else if (table === 'tool.poetry.dependencies' && key !== 'python') out.deps.push(key);
+  }
+  return out;
+}
+// Imports de um arquivo Python: só instruções de verdade (texto de docstring como "import of the module" não conta).
+// optional = dentro de um try cujo except segue em frente (X = None, pass, outro import): o script funciona sem.
+// Se o except encerra o script (sys.exit, raise: o clássico "instale X" seguido de saída), o módulo é necessário.
+function pyImportsOf(source) {
+  const lines = String(source).replace(/("""|''')[\s\S]*?\1/g, (m) => '""' + '\n'.repeat((m.match(/\n/g) || []).length)).split('\n');
+  const indent = (l) => l.match(/^[ \t]*/)[0].replace(/\t/g, '    ').length;
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^[ \t]*(?:from[ \t]+([A-Za-z_]\w*)[\w.]*[ \t]+import[ \t]+[\w*(]|import[ \t]+((?:[A-Za-z_][\w.]*(?:[ \t]+as[ \t]+\w+)?)(?:[ \t]*,[ \t]*[A-Za-z_][\w.]*(?:[ \t]+as[ \t]+\w+)?)*)[ \t]*(?:[#;].*)?$)/);
+    if (!m) continue;
+    const mods = m[1] ? [m[1]] : m[2].split(',').map((x) => x.trim().split(/[\s.]/)[0]);
+    const ind = indent(lines[i]);
+    let optional = false;
+    if (ind > 0) {
+      // o bloco que contém o import abre na linha anterior de recuo menor
+      let j = i - 1;
+      while (j >= 0 && (!lines[j].trim() || indent(lines[j]) >= ind)) j--;
+      const head = j >= 0 ? lines[j].trim() : '';
+      if (/^if\s+(typing\.)?TYPE_CHECKING\b/.test(head)) continue; // só para o verificador de tipos
+      if (/^except\b.*\b(ImportError|ModuleNotFoundError)\b/.test(head)) optional = true; // plano B de outro import
+      else if (/^try\s*:/.test(head)) {
+        const base = indent(lines[j]);
+        for (let k = i + 1; k < lines.length; k++) {
+          if (!lines[k].trim() || indent(lines[k]) > base) continue;
+          if (indent(lines[k]) !== base || !/^except\s*:|^except\b.*\b(ImportError|ModuleNotFoundError|Exception|BaseException)\b/.test(lines[k].trim())) break;
+          // corpo do except: o resto da própria linha e as linhas mais recuadas que vêm depois
+          let body = lines[k].trim().replace(/^except[^:]*:/, '');
+          for (let n = k + 1; n < lines.length && (!lines[n].trim() || indent(lines[n]) > base); n++) body += `\n${lines[n]}`;
+          optional = !/\b(sys\.exit|os\._exit|exit|quit|raise|SystemExit|abort)\b/.test(body);
+          break;
+        }
+      }
+    }
+    for (const mod of mods) out.push({ mod, optional });
+  }
+  return out;
+}
+// Argumentos que são pacotes numa linha "pip install …": sem opções (e o valor delas), caminhos, URLs e variáveis.
+function pkgArgs(rest) {
+  const out = [], toks = String(rest).split(/\s+/);
+  for (let i = 0; i < toks.length; i++) {
+    const a = toks[i].replace(/^["']+|["']+$/g, '');
+    if (/^(-r|-c|-e|-i|-p|-t|--python|--index-url|--extra-index-url|--from|--with|--target|--prefix|--constraint|--requirement|--editable)$/.test(a)) { i++; continue; }
+    if (!a || a.startsWith('-') || /[/\\:$`(){}]/.test(a) || /^[.~]/.test(a) || /\.(txt|toml|whl|gz|zip|in)$/.test(a)) continue;
+    out.push(a);
+  }
+  return out;
+}
+// Comandos de uma linha de shell: separa &&, ||, ; e |, e tira redirecionamentos (2>&1, 2>/dev/null), o sudo e a
+// barra de continuação.
+const shellParts = (line) => String(line).replace(/\\\s*$/, '').split(/\s*(?:&&|\|\||;|\|)\s*/)
+  .map((x) => x.replace(/\s+\d*>{1,2}\s*(?:&\d|\S+)/g, '').replace(/^sudo\s+/, '').trim()).filter(Boolean);
+
+// Pacote de que a skill faz parte: o pyproject.toml ou package.json mais próximo, da pasta dela até a raiz do clone.
+// Diz qual comando o pacote instala (console scripts / bin) e que Python ele pede. "cited" é a linha do README que
+// manda instalar o pacote pelo registro: sem ela (ou sem o SKILL.md pedir), o hub não instala nada por conta própria.
+function projectOf(root, d) {
+  const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let readme = null;
+  const cite = (re) => {
+    if (readme === null) readme = (readSmall(path.join(root, 'README.md')) || '').replace(/\r\n/g, '\n');
+    const m = readme.match(re);
+    return m ? `README.md: ${m[0].replace(/^[\s$>`]+/, '').replace(/\s+/g, ' ').slice(0, 80)}` : '';
+  };
+  for (let cur = d, i = 0; i < 12; cur = path.dirname(cur), i++) {
+    const rel = path.relative(root, cur);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) break;
+    const py = readSmall(path.join(cur, 'pyproject.toml'));
+    const p = py != null ? pyProject(py) : null;
+    if (p && p.name && DEP_NAME_RE.test(p.name)) {
+      return { type: 'py', name: p.name, bins: p.bins.filter((b) => DEP_NAME_RE.test(b)), requires: p.requires,
+        cited: cite(new RegExp(`^.*(?:uv\\s+tool\\s+install|uvx|pipx\\s+(?:install|run)|pip3?\\s+install|-m\\s+pip\\s+install)\\s[^\\n]*?(?<![\\w.-])${esc(p.name)}(?![\\w.-])`, 'mi')) };
+    }
+    let pkg = null;
+    try { pkg = JSON.parse(readSmall(path.join(cur, 'package.json')) || ''); } catch {}
+    if (isObj(pkg) && typeof pkg.name === 'string' && DEP_NAME_RE.test(pkg.name) && pkg.bin && !pkg.private) {
+      const bins = (typeof pkg.bin === 'string' ? [pkg.name.replace(/^@[^/]+\//, '')] : isObj(pkg.bin) ? Object.keys(pkg.bin) : []).filter((b) => DEP_NAME_RE.test(b));
+      return { type: 'npm', name: pkg.name, bins,
+        cited: cite(new RegExp(`^.*(?:(?:npm|pnpm|yarn|bun)\\s+(?:install|i|add|global\\s+add)\\s[^\\n]*?|npx\\s+(?:-y\\s+|--yes\\s+)?)(?<![\\w./-])${esc(pkg.name)}(?![\\w.-])`, 'mi')) };
+    }
+    if (cur === root) break;
+  }
+  return null;
+}
 
 // Arquivos regulares da skill (sem seguir links; limite de quantidade e tamanho).
 function skillFiles(dir) {
@@ -1212,7 +1543,8 @@ function codeLines(md) {
   const lines = [];
   for (const m of md.matchAll(/\`\`\`([A-Za-z0-9_-]*)[^\n]*\n([\s\S]*?)\`\`\`/g)) {
     if (m[1] && !/^(bash|sh|shell|zsh|console|terminal|cmd|powershell|ps1|text|)$/i.test(m[1])) continue;
-    for (const raw of m[2].split('\n')) {
+    // comando quebrado em várias linhas com "\" no fim: é um comando só (pip install \ ⏎ pacote-a ⏎ pacote-b)
+    for (const raw of m[2].replace(/\\[ \t]*\r?\n[ \t]*/g, ' ').split('\n')) {
       const l = raw.replace(/^\s*(?:\$|>|PS>)\s+/, '').trim();
       if (l && !l.startsWith('#')) lines.push(l);
     }
@@ -1224,8 +1556,12 @@ function codeLines(md) {
 }
 
 const PYTHON_DEP = { type: 'bin', name: IS_WIN ? 'python' : 'python3', label: 'Python 3', why: 'os scripts da skill são em Python', manual: 'https://www.python.org/downloads/', apt: 'python3', apk: 'python3', brew: 'python', winget: 'Python.Python.3.13', pacman: 'python' };
+// Nomes de módulo que quase sempre são arquivos do próprio projeto: nunca viram pacote do PyPI por palpite.
+const PY_LOCAL_RE = /^(utils?|helpers?|common|config|constants|settings|scripts|lib|src|core|main|app|models?|base|tools|types|schemas?|cli|api|server|client|data|db|logger|exceptions|errors|version|tests?|conftest)$/;
 // Dependências e passos deduzidos dos arquivos de uma skill. Cada item traz a evidência (de onde veio).
-function inferDeps(dir, folder) {
+// ctx.project: pacote de que a skill faz parte (ver projectOf); ctx.embedded: a skill mora dentro desse pacote;
+// ctx.pyVersion: Python desta máquina, para decidir marcadores como python_version < '3.11'.
+function inferDeps(dir, folder, ctx = {}) {
   const deps = new Map(), steps = [], envVars = new Set();
   const rel = (f) => path.relative(dir, f).split(path.sep).join('/');
   const add = (d, evidence) => {
@@ -1238,13 +1574,30 @@ function inferDeps(dir, folder) {
   };
   const addPip = (spec, evidence, optional = false) => {
     const pkg = pipName(spec);
-    if (!pkg || !DEP_NAME_RE.test(pkg) || pkg.startsWith('-')) return;
+    if (!pkg || !PIP_SPEC_RE.test(pkg)) return;
     const mod = importOf(pkg);
     if (!PY_MOD_RE.test(mod)) return;
     const d = add({ type: 'py', name: mod, pip: pkg, label: pipLabel(pkg), why: 'usado pelos scripts da skill', optional }, evidence);
     const full = pipSpecOf(spec);
     if (full && full !== pkg && !d.spec) d.spec = full;
   };
+  // linha de manifesto (requirements, pyproject): o marcador depois do ";" decide se vale nesta máquina
+  const declared = new Set();
+  const addReq = (line, evidence) => {
+    const [req, ...marker] = String(line).split(';');
+    const pkg = pipName(req);
+    if (pkg) declared.add(importOf(pkg));
+    const ok = markerOk(marker.join(';'), ctx.pyVersion);
+    if (ok !== false) addPip(req, evidence, ok === null);
+  };
+  // ferramenta de linha de comando distribuída no PyPI: vai para um ambiente isolado (uv, pipx), não para o Python dos scripts
+  const addTool = (spec, evidence) => {
+    const pkg = pipName(spec);
+    if (!pkg || !PIP_SPEC_RE.test(pkg)) return null;
+    for (const [k, d] of deps) if (d.type === 'py' && normPkg(d.pip) === normPkg(pkg)) deps.delete(k);
+    return add({ type: 'pytool', name: pkg, pip: pkg, label: `${pkg} (ferramenta Python)`, why: 'programa de linha de comando que a skill usa' }, evidence);
+  };
+  const isTool = (pkg) => [...deps.values()].some((d) => d.type === 'pytool' && normPkg(d.name) === normPkg(pkg));
   // programa conhecido citado num arquivo da skill; em script conta como necessário, em texto do SKILL.md como opcional
   const addKnownBin = (word, evidence, optional) => {
     const bin = BIN_OF_ALIAS[word];
@@ -1266,26 +1619,30 @@ function inferDeps(dir, folder) {
   const files = skillFiles(dir);
   const names = new Set(files.map((f) => path.basename(f).replace(/\.[^.]+$/, '')));
   for (const f of files) { let d = path.dirname(rel(f)); while (d && d !== '.') { names.add(path.basename(d)); d = path.dirname(d); } }
-  const localModule = (m) => names.has(m) || /^(utils|helpers|common|config|scripts|lib|src|core|main|app)$/.test(m);
+  // pasta que é ela mesma um pacote Python (__init__.py na raiz): os scripts se importam pelo nome dela.
+  // Fora desse caso o nome da skill não é módulo local: a skill "matplotlib" importa a biblioteca matplotlib
+  if (files.some((f) => rel(f) === '__init__.py')) for (const n of [folder, path.basename(dir)]) if (n) names.add(String(n).replace(/-/g, '_'));
+  const localModule = (m) => names.has(m) || PY_LOCAL_RE.test(m);
 
-  const md = readSmall(path.join(dir, 'SKILL.md')) || '';
+  const md = readSmall(path.join(dir, skillFileOf(dir) || 'SKILL.md')) || '';
   // 1) manifestos
   for (const f of files) {
     const r = rel(f), base = path.basename(f);
     if (/^requirements[^/]*\.txt$/.test(base) || base === 'requirements.in') {
       for (const line of (readSmall(f) || '').split('\n')) {
-        const l = line.replace(/#.*$/, '').trim();
+        const l = line.replace(/(^|\s)#.*$/, '').trim();
         if (!l || l.startsWith('-')) continue;
-        addPip(l, r);
+        addReq(l, r);
       }
     } else if (base === 'pyproject.toml') {
-      const t = readSmall(f) || '';
-      const m = t.match(/^\s*dependencies\s*=\s*\[([\s\S]*?)\]/m);
-      if (m) for (const q of m[1].matchAll(/["']([^"']+)["']/g)) addPip(q[1], r);
+      const p = pyProject(readSmall(f) || '');
+      for (const q of p.deps) addReq(q, r);
+      // extras (optional-dependencies) não são instalados, mas contam como declarados: um import deles é opcional
+      for (const q of p.extras) { const pkg = pipName(String(q).split(';')[0]); if (pkg) declared.add(importOf(pkg)); }
     } else if (base === 'Pipfile') {
       const t = readSmall(f) || '';
       const sec = (t.match(/^\[packages\]\s*\n([\s\S]*?)(?=^\[|$(?![\s\S]))/m) || [])[1] || '';
-      for (const line of sec.split('\n')) { const k = line.split('=')[0].trim(); if (k) addPip(k, r); }
+      for (const line of sec.split('\n')) { const k = line.split('=')[0].trim(); if (k) addReq(k, r); }
     } else if (base === 'package.json' && !r.includes('/node_modules/')) {
       let pkg = null;
       try { pkg = JSON.parse(readSmall(f) || ''); } catch {}
@@ -1307,13 +1664,11 @@ function inferDeps(dir, folder) {
     const sb = s.match(/^#![^\n]*/);
     if (sb) { const w = sb[0].replace(/^#!\s*\S*\/(?:env\s+(?:-S\s+)?)?/, '').split(/\s/)[0]; if (w) shebangs.add(w.replace(/\d+(\.\d+)*$/, (v) => (w.startsWith('python') ? '3' : ''))); }
     if (/\.py$/.test(f)) {
-      for (const m of s.matchAll(/^[ \t]*(?:from[ \t]+([A-Za-z_][\w]*)[\w.]*[ \t]+import|import[ \t]+([^\n#;]+))/gm)) {
-        // "import a, b.c as d": cada item da lista conta
-        const mods = m[1] ? [m[1]] : m[2].split(',').map((x) => x.trim().split(/[\s.]/)[0]).filter((x) => /^[A-Za-z_]\w*$/.test(x));
-        for (const mod of mods) {
-          if (PY_STDLIB.has(mod) || localModule(mod) || PY_IMPORT_PKG[mod] === '') continue;
-          if (!pyImports.has(mod)) pyImports.set(mod, r);
-        }
+      for (const { mod, optional } of pyImportsOf(s)) {
+        if (PY_STDLIB.has(mod) || localModule(mod) || PY_IMPORT_PKG[mod] === '') continue;
+        const prev = pyImports.get(mod);
+        if (!prev) pyImports.set(mod, { file: r, optional });
+        else if (!optional) prev.optional = false;
       }
     } else if (/\.(js|cjs|mjs|ts)$/.test(f)) {
       for (const m of s.matchAll(/(?:require\(\s*|from\s+|import\s+)['"]([^'"./][^'"]*)['"]/g)) {
@@ -1333,48 +1688,93 @@ function inferDeps(dir, folder) {
     const hay = isShell ? text.replace(/^\s*#.*$/gm, '') : [...text.matchAll(/(["'`])((?:(?!\1)[^\n\\]){1,200})\1/g)].map((q) => q[2]).filter((q) => /^[\w.-]+( |$)/.test(q)).map((q) => q.split(/\s/)[0]).join('\n');
     for (const m of hay.matchAll(BIN_WORD_RE)) addKnownBin(m[1], `${rel(f)} chama ${m[1]}`, false);
   }
-  for (const [mod, r] of pyImports) {
+  for (const [mod, info] of pyImports) {
     const pkg = PY_IMPORT_PKG[mod] || mod;
-    add({ type: 'py', name: mod, pip: pkg, label: pipLabel(pkg), why: 'importado pelos scripts da skill' }, `${r} importa ${mod}`);
+    // com manifesto na skill, ele é a lista oficial: import que não está nele é recurso extra (ou módulo do projeto)
+    const undeclared = declared.size > 0 && !declared.has(mod);
+    add({ type: 'py', name: mod, pip: pkg, label: pipLabel(pkg), why: 'importado pelos scripts da skill', optional: info.optional || undeclared },
+      `${info.file} importa ${mod}${info.optional ? ' (o script tem plano B se faltar)' : undeclared ? ' (fora do manifesto da skill)' : ''}`);
   }
-  // 3) comandos de instalação citados no SKILL.md
+  // 3) comandos de instalação citados no SKILL.md (em qualquer ponto da linha: depois de &&, de um if, antes de um | tail)
   const consumed = new Set();
-  for (const line of codeLines(md)) {
+  const lines = codeLines(md);
+  const cite = (line) => `SKILL.md: ${line.slice(0, 80)}`;
+  // primeiro as ferramentas (uv tool install, pipx install): o mesmo pacote num "pip install" depois é a mesma ferramenta
+  for (const line of lines) for (const part of shellParts(line)) {
+    const m = part.match(/^(?:uv\s+tool\s+install|pipx\s+install)\s+(.+)$/i);
+    if (!m) continue;
+    for (const a of pkgArgs(m[1])) {
+      const d = addTool(a, cite(line));
+      const full = d && pipSpecOf(a);
+      if (full && full !== d.pip && !d.spec) d.spec = full;
+      if (d) consumed.add(line);
+    }
+  }
+  const proj = ctx.project && ctx.project.name ? ctx.project : null;
+  for (const line of lines) for (const part of shellParts(line)) {
     let m;
-    if ((m = line.match(/^(?:sudo\s+)?(?:(?:python3?|py)\s+-m\s+pip|pip3?|uv\s+pip)\s+install\s+(.+)$/i))) {
-      const args = m[1].split(/\s+/).filter((a) => a && !a.startsWith('-') && a !== 'install' && !/^(\.|\/|~)/.test(a) && !/\.txt$/.test(a));
-      if (/-r\s+\S+/.test(m[1]) && !args.length) { consumed.add(line); continue; } // requirements.txt já foi lido
-      for (const a of args) addPip(a, `SKILL.md: ${line.slice(0, 80)}`);
-      if (args.length) consumed.add(line);
-    } else if ((m = line.match(/^(?:sudo\s+)?(?:npm|pnpm|yarn|bun)\s+(?:install|add|i)\s+(?:-g|--global)\s+(.+)$/i)) || (m = line.match(/^(?:sudo\s+)?(?:npm|pnpm|yarn|bun)\s+(?:install|add|i)\s+(.+?)\s+(?:-g|--global)\s*$/i))) {
-      for (const a of m[1].split(/\s+/).filter((a) => a && !a.startsWith('-'))) {
-        const name = a.replace(/@(latest|next|[\d^~][^\s]*)$/, '');
-        if (DEP_NAME_RE.test(name)) { add({ type: 'npm', name, npm: name, label: `Node: ${name}`, why: 'ferramenta de linha de comando pedida pelo SKILL.md' }, `SKILL.md: ${line.slice(0, 80)}`); consumed.add(line); }
+    if ((m = part.match(/^(?:\S+\s+-m\s+pip|pip3?|uv\s+pip)\s+install\s+(.+)$/i))) {
+      const args = pkgArgs(m[1]);
+      if (/(^|\s)-r\s+\S+/.test(m[1]) && !args.length) { consumed.add(line); continue; } // requirements.txt já foi lido
+      for (const a of args) {
+        const pkg = pipName(a);
+        // o pacote do próprio projeto, com comando de terminal, é ferramenta mesmo quando o SKILL.md manda "pip install"
+        const ownTool = proj && proj.type === 'py' && proj.bins.length && normPkg(proj.name) === normPkg(pkg);
+        if (isTool(pkg)) continue;           // extras da ferramenta (pacote[extra]) são opcionais: não entram
+        if (ownTool) addTool(pkg, cite(line));
+        else addPip(a, cite(line));
       }
-    } else if ((m = line.match(/^(?:sudo\s+)?brew\s+install\s+(.+)$/i))) {
-      for (const a of m[1].split(/\s+/).filter((a) => a && !a.startsWith('-'))) addSysPkg(a, 'brew', `SKILL.md: ${line.slice(0, 80)}`);
+      if (args.length) consumed.add(line);
+    } else if ((m = part.match(/^(?:npm|pnpm|yarn|bun)\s+(?:install|add|i)\s+(?:-g|--global)\s+(.+)$/i)) || (m = part.match(/^(?:npm|pnpm|yarn|bun)\s+(?:install|add|i)\s+(.+?)\s+(?:-g|--global)\s*$/i))) {
+      for (const a of m[1].split(/\s+/).filter((a) => a && !a.startsWith('-'))) {
+        const name = a.replace(/^["']|["']$/g, '').replace(/@(latest|next|[\d^~][^\s]*)$/, '');
+        if (DEP_NAME_RE.test(name)) { add({ type: 'npm', name, npm: name, label: `Node: ${name}`, why: 'ferramenta de linha de comando pedida pelo SKILL.md' }, cite(line)); consumed.add(line); }
+      }
+    } else if ((m = part.match(/^brew\s+install\s+(.+)$/i))) {
+      for (const a of m[1].split(/\s+/).filter((a) => a && !a.startsWith('-'))) addSysPkg(a, 'brew', cite(line));
       consumed.add(line);
-    } else if ((m = line.match(/^(?:sudo\s+)?apt(?:-get)?\s+install\s+(.+)$/i))) {
-      for (const a of m[1].split(/\s+/).filter((a) => a && !a.startsWith('-'))) addSysPkg(a, 'apt', `SKILL.md: ${line.slice(0, 80)}`);
+    } else if ((m = part.match(/^apt(?:-get)?\s+install\s+(.+)$/i))) {
+      for (const a of m[1].split(/\s+/).filter((a) => a && !a.startsWith('-'))) addSysPkg(a, 'apt', cite(line));
       consumed.add(line);
-    } else if ((m = line.match(/^winget\s+install\s+(?:.*--id\s+)?(\S+)/i))) {
-      addSysPkg(m[1], 'winget', `SKILL.md: ${line.slice(0, 80)}`);
+    } else if ((m = part.match(/^winget\s+install\s+(?:.*--id\s+)?(\S+)/i))) {
+      addSysPkg(m[1], 'winget', cite(line));
       consumed.add(line);
     }
   }
+  // o pacote de que a skill faz parte: completa a ferramenta que o SKILL.md já pede (comandos e Python exigido) ou,
+  // se o SKILL.md só usa o comando sem dizer como instalar, entra pela linha de instalação do README
+  if (proj && proj.bins.length) {
+    const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const uses = ctx.embedded || proj.bins.some((b) => new RegExp(`(^|[\\s\`$(|;&"'])${esc(b)}(?=[\\s\`)"']|$)`, 'm').test(lines.join('\n')));
+    if (proj.type === 'py') {
+      let d = [...deps.values()].find((x) => x.type === 'pytool' && normPkg(x.name) === normPkg(proj.name));
+      if (!d && uses && proj.cited) d = addTool(proj.name, proj.cited);
+      if (d) {
+        d.bins = proj.bins;
+        if (proj.requires) d.requires = proj.requires;
+        d.label = `${proj.bins[0]} (ferramenta Python: ${d.pip})`;
+      }
+    } else if (proj.type === 'npm' && uses && proj.cited && !deps.has(`npm:${proj.name}`)) {
+      add({ type: 'npm', name: proj.name, npm: proj.name, label: `Node: ${proj.name}`, why: 'ferramenta de linha de comando que a skill usa' }, proj.cited);
+    }
+  }
   // cabeçalho do SKILL.md: dependencies: python>=3.8, pandas>=1.5.0
-  const fm = (md.replace(/\r\n/g, '\n').match(/^---\s*\n([\s\S]*?)\n---/) || [])[1] || '';
+  const fm = frontOf(md);
   for (const item of fmValue(fm, 'dependencies').replace(/^\[|\]$/g, '').split(/[,\n]/).map((x) => x.replace(/^\s*-\s*/, '').replace(/^["']|["']$/g, '').trim()).filter(Boolean)) {
     const base = pipName(item).toLowerCase();
     if (/^python\d*$/.test(base)) shebangs.add('python3');
     else if (/^node(js)?$/.test(base)) shebangs.add('node');
     else if (BIN_OF_ALIAS[base]) addKnownBin(base, 'SKILL.md: dependencies', false);
-    else addPip(item, 'SKILL.md: dependencies');
+    else if (!isTool(base)) addPip(item, 'SKILL.md: dependencies');
   }
   // programas conhecidos usados nos comandos de exemplo do SKILL.md (primeira palavra de cada comando)
-  for (const line of codeLines(md)) {
-    const first = line.replace(/^sudo\s+/, '').split(/\s+/)[0];
-    if (BIN_OF_ALIAS[first]) addKnownBin(first, `SKILL.md: ${line.slice(0, 60)}`, true);
+  for (const line of lines) {
+    if (consumed.has(line)) continue; // linha de instalação que o hub já assumiu: o instalador dela (uv, pipx) não é dependência
+    // cada comando da linha conta: em "aws … | jq …" o jq também é usado
+    for (const part of shellParts(line)) {
+      const first = part.split(/\s+/)[0];
+      if (BIN_OF_ALIAS[first]) addKnownBin(first, `SKILL.md: ${line.slice(0, 60)}`, true);
+    }
   }
   // …e em trechos de código no meio do texto (`pandoc -t markdown arquivo.docx`)
   for (const m of md.replace(/\`\`\`[\s\S]*?\`\`\`/g, '').matchAll(/\`([^\`\n]{2,160})\`/g)) {
@@ -1383,10 +1783,11 @@ function inferDeps(dir, folder) {
   }
   // 4) programas usados pelos shebangs
   if (shebangs.has('python3') || shebangs.has('python') || pyImports.size) add({ ...PYTHON_DEP }, 'scripts .py');
+  if (shebangs.has('uv')) addKnownBin('uv', 'scripts com shebang "uv run"', false);
   if (shebangs.has('node') || nodeReqs.size) add({ type: 'bin', name: 'node', label: 'Node.js', why: 'os scripts da skill são em Node', manual: 'https://nodejs.org', apt: 'nodejs', brew: 'node', winget: 'OpenJS.NodeJS.LTS', pacman: 'nodejs' }, 'scripts .js');
   // 5) passos que o hub não faz sozinho: outros comandos de setup e variáveis de ambiente
   const seenCmd = new Set();
-  for (const line of codeLines(md)) {
+  for (const line of lines) {
     if (consumed.has(line) || seenCmd.has(line) || !SETUP_CMD_RE.test(line)) continue;
     if (!/\b(install|add|sync|init|login|auth|setup)\b/i.test(line) || /\b(run|test|start|exec|build)\b/i.test(line.split(/\s+/)[1] || '')) continue;
     // "pip install" ou "npm install" citados soltos no texto, sem dizer o quê: não é um passo
@@ -1395,7 +1796,9 @@ function inferDeps(dir, folder) {
     if (steps.length < 8) steps.push({ kind: 'cmd', title: 'Comando pedido pelo SKILL.md', detail: '', cmd: line.slice(0, 160), evidence: 'SKILL.md' });
   }
   for (const m of md.matchAll(ENV_VAR_RE)) if (!/^(YOUR|MY|EXAMPLE|SOME|XXX|FOO)_/.test(m[1])) envVars.add(m[1]);
-  for (const v of [...envVars].slice(0, 6)) steps.push({ kind: 'env', title: `Variável de ambiente ${v}`, detail: 'o SKILL.md faz referência a ela: defina no ambiente da conta antes de usar', cmd: '', evidence: 'SKILL.md' });
+  // um passo só para todas: quatro linhas iguais (uma por chave de API opcional) escondem o que importa
+  const vars = [...envVars].slice(0, 6);
+  if (vars.length) steps.push({ kind: 'env', title: `${vars.length > 1 ? 'Variáveis' : 'Variável'} de ambiente ${vars.join(', ')}`, detail: `o SKILL.md cita ${vars.length > 1 ? 'essas variáveis: defina no ambiente da conta as dos recursos que você for usar' : 'essa variável: defina-a no ambiente da conta se for usar o recurso que depende dela'}`, cmd: '', evidence: 'SKILL.md' });
   if (nodeReqs.size && !files.some((f) => path.basename(f) === 'package.json')) {
     const list = [...nodeReqs.keys()];
     steps.push({ kind: 'cmd', title: `Pacotes Node usados pelos scripts (${list.slice(0, 6).join(', ')}${list.length > 6 ? '…' : ''})`, detail: 'não há package.json na skill: instale-os na pasta da skill se os scripts falharem', cmd: `npm install ${list.slice(0, 8).join(' ')}`, evidence: [...nodeReqs.values()][0] });
@@ -1417,7 +1820,10 @@ async function skillDirs(folders, opts) {
   const out = new Map();
   if (opts.source) {
     const src = await fetchSource(opts.source);
-    for (const f of folders) { const sk = src.skills.find((x) => x.folder === f); if (sk) out.set(f, { dir: sk.dir, label: src.label, compatibility: sk.compatibility || '' }); }
+    for (const f of folders) {
+      const sk = src.skills.find((x) => x.folder === f);
+      if (sk) out.set(f, { dir: sk.dir, label: src.label, compatibility: sk.compatibility || '', project: projectOf(src.dir, sk.home || sk.dir), embedded: Boolean(sk.embedded) });
+    }
   } else if (opts.installed) {
     for (const t of skillTargets()) for (const sk of t.skills) {
       if (!folders.includes(sk.folder) || out.has(sk.folder)) continue;
@@ -1436,6 +1842,7 @@ async function depsFor(folders, opts = {}) {
   const all = currentDeps();
   const dirs = await skillDirs(folders, opts);
   const steps = [], compat = {}, origin = {};
+  let pyVer;
   for (const f of folders) {
     const where = dirs.get(f);
     const cat = catalogItemOf(f);
@@ -1448,7 +1855,8 @@ async function depsFor(folders, opts = {}) {
       if (py.length && !list.some((d) => d.type === 'bin' && /^python3?$/.test(d.name))) list.unshift({ ...PYTHON_DEP, optional: py.every((d) => d.optional) });
     }
     else if (where) {
-      const inf = inferDeps(where.dir, f);
+      if (pyVer === undefined) pyVer = await pyVersion();
+      const inf = inferDeps(where.dir, f, { project: where.project, embedded: where.embedded, pyVersion: pyVer });
       list = inf.deps; origin[f] = 'inferida';
       for (const s of inf.steps) steps.push({ ...s, skill: f });
     } else origin[f] = 'desconhecida';
@@ -1484,27 +1892,87 @@ const MANUAL_URL = { node: 'https://nodejs.org', pip: 'https://pip.pypa.io/en/st
 
 // how de cada dependência que falta:
 //   pip | npm | brew  → o hub instala sozinho, sem sudo
+//   pytool            → ferramenta de linha de comando do PyPI: o hub instala sozinho num ambiente isolado (uv, pipx)
+//                       ou, sem eles, no Python do usuário
 //   sys               → gerenciador do sistema (apt, dnf, zypper, pacman, apk): precisa de sudo, sai em sysCommand
 //   needs-pip         → módulo Python sem pip na máquina: o pip entra em sysCommand e a skill deve ser instalada de novo depois
 //   npm-sudo          → pacote Node com npm global do root: sai em npmCommand
 //   winget            → programa no Windows: sai em sysCommand (sem sudo, pode abrir o UAC)
 //   manual            → só à parte, com link em manual[]
+const AUTO_HOW = ['pip', 'npm', 'brew', 'pytool'];
+const UV_URL = 'https://docs.astral.sh/uv/getting-started/installation/';
+
+// Uma chamada só ao Python para tudo o que depende dele: versão, se há pip, módulos importáveis e pacotes instalados.
+// find_spec não executa o módulo (importar de verdade rodaria código de terceiros só para conferir); o pacote instalado
+// (importlib.metadata) cobre os casos em que o nome no pip e o nome do import são diferentes.
+const PY_FACTS = `
+import os, sys, json
+q = json.loads(os.environ.get("HUB_PY_IN") or "{}")
+out = {"version": ".".join(str(x) for x in sys.version_info[:3]), "venv": sys.prefix != getattr(sys, "base_prefix", sys.prefix), "mods": {}, "dists": {}}
+try:
+    import importlib.util as u
+    def has(m):
+        try: return u.find_spec(m) is not None
+        except Exception: return False
+except Exception:
+    def has(m): return False
+try:
+    import importlib.metadata as md
+    def dist(d):
+        try: md.version(d); return True
+        except Exception: return False
+except Exception:
+    def dist(d): return False
+out["pip"] = has("pip")
+for m in q.get("mods", []): out["mods"][m] = has(m)
+for d in q.get("dists", []): out["dists"][d] = dist(d)
+print(json.dumps(out))
+`;
+async function pyFacts(mods = [], dists = []) {
+  const none = { version: '', venv: false, pip: false, mods: {}, dists: {} };
+  const r = await pyScript(PY_FACTS, JSON.stringify({ mods: mods.filter((m) => PY_MOD_RE.test(m)), dists: dists.filter((d) => DEP_NAME_RE.test(d)) }), 20000);
+  if (!r.ok) return none;
+  try { return { ...none, ...JSON.parse(r.stdout.split('\n').pop()) }; } catch { return none; }
+}
+let pyVer = null;
+const pyVersion = async () => (pyVer !== null ? pyVer : (pyVer = (await pyFacts()).version));
+// Ferramentas que o uv e o pipx já instalaram (nome do pacote, normalizado).
+async function pyToolsInstalled() {
+  const names = new Set();
+  const [uv, pipx] = await Promise.all([
+    which('uv').then((ok) => (ok ? run('uv', ['tool', 'list'], 15000) : null)),
+    which('pipx').then((ok) => (ok ? run('pipx', ['list', '--short'], 15000) : null)),
+  ]);
+  for (const r of [uv, pipx]) if (r && r.ok) for (const l of r.stdout.split('\n')) { const m = l.match(/^([A-Za-z0-9][A-Za-z0-9._-]*)\s+v?\d/); if (m) names.add(normPkg(m[1])); }
+  return names;
+}
+
 async function checkDeps(folders, opts = {}) {
   const { deps, steps, compat, origin } = await depsFor(folders, opts);
-  const [npmRoot, hasPip, pm, hasBrew, hasWinget, hasNpm] = await Promise.all([
+  const tools = deps.filter((d) => d.type === 'pytool');
+  const [npmRoot, facts, pm, hasBrew, hasWinget, hasNpm, hasUv, hasPipx, toolSet] = await Promise.all([
     run('npm', ['root', '-g'], 10000).then((r) => (r.ok ? r.stdout : '')),
-    pyRun(['-m', 'pip', '--version'], 10000).then((r) => r.ok),
+    pyFacts(deps.filter((d) => d.type === 'py').map((d) => d.name), deps.filter((d) => d.type === 'py' || d.type === 'pytool').map((d) => d.pip).filter(Boolean)),
     systemPm(),
     IS_MAC ? which('brew') : false,
     IS_WIN ? which('winget') : false,
     which('npm'),
+    which('uv'),
+    which('pipx'),
+    tools.length ? pyToolsInstalled() : new Set(),
   ]);
+  const hasPip = facts.pip;
   const npmSudo = hasNpm && (await npmNeedsSudo());
   await Promise.all(deps.map(async (d) => {
     if (!DEP_NAME_RE.test(d.name) || (d.type === 'py' && !PY_MOD_RE.test(d.name))) { d.ok = false; d.how = 'manual'; return; }
     if (d.type === 'bin') d.ok = await which(d.name);
-    else if (d.type === 'py') d.ok = (await pyRun(['-c', `import ${d.name}`])).ok;
+    else if (d.type === 'py') d.ok = Boolean(facts.mods[d.name] || (d.pip && facts.dists[d.pip]));
     else if (d.type === 'npm') d.ok = Boolean(npmRoot) && fs.existsSync(path.join(npmRoot, d.name, 'package.json'));
+    else if (d.type === 'pytool') {
+      // instalada de qualquer jeito: pelo comando no PATH, pelo uv/pipx ou no Python do usuário
+      d.ok = Boolean(facts.dists[d.pip]) || toolSet.has(normPkg(d.name));
+      for (const b of [...(d.bins || []), d.name]) if (!d.ok && DEP_NAME_RE.test(b)) d.ok = await which(b);
+    }
     if (d.ok) { d.how = ''; return; }
     const sysPkg = pm ? sysPkgOf(d, pm) : '';
     if (d.type === 'py') {
@@ -1512,6 +1980,18 @@ async function checkDeps(folders, opts = {}) {
       else if (pm) { d.how = sysPkg ? 'sys' : 'needs-pip'; d.pkg = sysPkg; }
       else if (IS_WIN && hasWinget) { d.how = 'winget'; d.pkg = 'Python.Python.3.13'; d.note = 'instala o Python com pip; depois instale a skill de novo'; }
       else { d.how = 'manual'; d.manual = d.manual || MANUAL_URL.pip; }
+    } else if (d.type === 'pytool') {
+      // caminho direto: uv, pipx ou o pip do usuário (se o Python da máquina atende o pacote). Sem nenhum deles, o hub
+      // traz o uv antes, e isso fica dito na lista: nada entra na máquina sem aparecer para quem vai confirmar
+      const direct = hasUv || hasPipx || (hasPip && pyVersionOk(facts.version, d.requires));
+      const uvFrom = IS_MAC && hasBrew ? 'Homebrew' : hasPip ? 'pip' : '';
+      d.how = direct || uvFrom ? 'pytool' : 'manual';
+      if (d.how === 'manual') d.manual = UV_URL;
+      else if (!direct) {
+        d.needsUv = true;
+        d.note = `antes o hub instala o uv pelo ${uvFrom}: ${hasPip ? `o pacote pede Python ${d.requires} e o desta máquina é ${facts.version}` : 'este Python não tem pip'}`;
+        d.why = `${d.why} · ${d.note}`;
+      }
     } else if (d.type === 'npm') {
       if (!hasNpm) { d.how = 'manual'; d.manual = MANUAL_URL.node; }
       else d.how = npmSudo ? 'npm-sudo' : 'npm';
@@ -1539,27 +2019,127 @@ async function checkDeps(folders, opts = {}) {
     steps, compat, origin,
     inferred: deps.some((d) => d.inferred),
     allOk: need.length === 0,
-    auto: need.filter((d) => ['pip', 'npm', 'brew'].includes(d.how)).map((d) => d.label),
+    auto: need.filter((d) => AUTO_HOW.includes(d.how)).map((d) => d.label),
     sysCommand, sysArgs, sysRuns, sysSudo, sysPm: pm ? pm.id : IS_WIN && hasWinget ? 'winget' : '',
     npmCommand: npmArgs.length ? `sudo ${npmArgs.join(' ')}` : '', npmArgs,
     aptCommand: sysCommand, // nome antigo, mantido para quem já consumia a API
-    manual: need.filter((d) => d.how === 'manual').map((d) => ({ label: d.label, url: d.manual || '', pkg: d.apt || d.brew || '' })),
-    hasPip,
+    manual: need.filter((d) => d.how === 'manual').map((d) => (d.type === 'pytool'
+      ? { label: `uv, para instalar ${d.name} (ou Python com pip)`, url: d.manual || UV_URL, pkg: '' }
+      : { label: d.label, url: d.manual || '', pkg: d.apt || d.brew || '' })),
+    hasPip, pyVersion: facts.version,
   };
+}
+
+// Motivo de uma falha do pip ou do uv, em uma frase. O texto cru deles tem dezenas de linhas.
+function pipWhy(stderr) {
+  const t = String(stderr || '');
+  if (/Temporary failure in name resolution|nodename nor servname|Name or service not known|Connection (?:refused|reset|timed out)|ConnectTimeout|ReadTimeout|ProxyError|SSLError|Max retries exceeded|Network is unreachable|error sending request|dns error|failed to fetch/i.test(t)) return 'sem conexão com o PyPI (rede ou proxy)';
+  if (/require[sd]? a different python|Requires-Python|does not satisfy Python|current Python version/i.test(t)) return 'o pacote pede outra versão do Python';
+  if (/No matching distribution found|Could not find a version that satisfies|was not found in the package registry|not found in the package registry/i.test(t)) return 'não existe no PyPI com esse nome, ou não tem versão para o seu Python';
+  if (/Microsoft Visual C\+\+|command '[^']*(?:gcc|cc|clang|cl\.exe)'|Failed building wheel|Failed to build|subprocess-exited-with-error|metadata-generation-failed/i.test(t)) return 'precisa ser compilado e falta o compilador C (ou os cabeçalhos do Python)';
+  if (/Permission denied|EACCES|Access is denied/i.test(t)) return 'sem permissão para gravar na pasta do Python';
+  if (/No module named pip/i.test(t)) return 'este Python não tem pip';
+  if (/No space left/i.test(t)) return 'disco cheio';
+  return (t.split('\n').map((l) => l.trim()).filter((l) => l && !/^\[notice\]|^WARNING:|^hint:|^note:|^\s*[╰│├▶─]/i.test(l)).pop() || 'falhou sem dizer o motivo').slice(0, 200);
+}
+const PIP_TIMEOUT = 15 * 60 * 1000;
+// pip install no Python do usuário. Um pacote com problema derruba o lote inteiro: aí tenta um por um, para os outros
+// entrarem e sobrar só o nome e o motivo do que não deu.
+async function pipInstall(pkgs, { upgrade = false, facts } = {}) {
+  const f = facts || (await pyFacts());
+  const notes = [];
+  let flags = f.venv ? [] : ['--user'];
+  const attempt = async (list) => {
+    const args = (fl) => ['-m', 'pip', 'install', '--disable-pip-version-check', '--quiet', ...(upgrade ? ['--upgrade'] : []), ...fl, ...list];
+    let r = await pyRun(args(flags), PIP_TIMEOUT);
+    // PEP 668: Python do sistema recusa pip --user sem esta flag
+    if (!r.ok && !f.venv && /externally-managed/i.test(r.stderr) && !flags.includes('--break-system-packages')) {
+      flags = ['--user', '--break-system-packages'];
+      notes.push('Python do sistema é gerenciado (PEP 668): instalando só no seu usuário com --break-system-packages');
+      r = await pyRun(args(flags), PIP_TIMEOUT);
+    }
+    return r;
+  };
+  const r = await attempt(pkgs);
+  if (r.ok) return { ok: pkgs, failed: [], notes };
+  const why = pipWhy(r.stderr);
+  if (pkgs.length === 1 || /^sem conexão|não tem pip|disco cheio/.test(why)) return { ok: [], failed: pkgs.map((p) => [p, why]), notes };
+  const ok = [], failed = [];
+  for (const p of pkgs) { const one = await attempt([p]); if (one.ok) ok.push(p); else failed.push([p, pipWhy(one.stderr)]); }
+  return { ok, failed, notes };
+}
+// Onde o pip do usuário põe os executáveis (macOS: ~/Library/Python/X.Y/bin, que não costuma estar no PATH).
+async function pyUserBin() {
+  const r = await pyScript('import sys, sysconfig\ntry:\n    s = sysconfig.get_preferred_scheme("user")\nexcept Exception:\n    s = "nt_user" if sys.platform == "win32" else "posix_user"\nprint(sysconfig.get_path("scripts") if sys.prefix != getattr(sys, "base_prefix", sys.prefix) else sysconfig.get_path("scripts", s))', '', 10000);
+  return r.ok ? r.stdout.split('\n').pop().trim() : '';
+}
+// uv: o do PATH ou, sem ele, o que o hub consegue trazer sem sudo (Homebrew no macOS, pip no resto).
+// É ele que resolve "o pacote pede um Python mais novo que o da máquina": baixa o Python certo sozinho.
+// bootstrap só vale quando a lista de dependências já avisou que o uv entra (needsUv em checkDeps).
+async function findUv(bootstrap = false) {
+  if (await which('uv')) return 'uv';
+  const exe = IS_WIN ? 'uv.exe' : 'uv';
+  const local = async () => { const d = await pyUserBin(); const f = d ? path.join(d, exe) : ''; return f && fs.existsSync(f) ? f : ''; };
+  let at = await local();
+  if (at || !bootstrap) return at;
+  if (IS_MAC && (await which('brew'))) {
+    progress(0, 'Instalando o uv pelo Homebrew');
+    if ((await run('brew', ['install', 'uv'], 15 * 60 * 1000, { HOMEBREW_NO_AUTO_UPDATE: '1' })).ok) { await refreshPath(); if (await which('uv')) return 'uv'; }
+  }
+  const f = await pyFacts();
+  if (f.pip) {
+    progress(0, 'Instalando o uv pelo pip');
+    if ((await pipInstall(['uv'], { facts: f })).ok.length) at = await local();
+  }
+  return at;
+}
+// Instala (ou atualiza) uma ferramenta de linha de comando do PyPI. Só pelo nome no registro: nunca git, URL ou pasta.
+// Ordem: uv (ambiente isolado, traz o Python que o pacote pede) → pipx → pip do usuário, se o Python da máquina atende
+// o pacote. bootstrap: sem nenhum caminho direto, o hub traz o uv primeiro. Devolve { ok, via } ou { ok: false, why, hint }.
+async function installPyTool(spec, { requires = '', upgrade = false, bootstrap = false } = {}) {
+  const pkg = pipName(spec);
+  const hint = `uv tool install ${pkg}`;
+  if (!PIP_SPEC_RE.test(String(spec)) || !PIP_SPEC_RE.test(pkg)) return { ok: false, why: 'nome de pacote inválido', hint: '' };
+  const tries = [];
+  const done = async (via) => { await refreshPath(); const d = await pyUserBin(); if (d) addToPath([d]); return { ok: true, via }; };
+  const viaUv = async (uv, label) => {
+    const r = await run(uv, ['tool', 'install', '--upgrade', spec], PIP_TIMEOUT);
+    if (r.ok) return true;
+    tries.push(`${label}: ${pipWhy(r.stderr)}`);
+    return false;
+  };
+  const had = await findUv();
+  const uvPath = had || (bootstrap ? await findUv(true) : '');
+  if (uvPath && (await viaUv(uvPath, 'uv'))) return done(had ? 'uv' : 'uv, que o hub instalou agora');
+  if (await which('pipx')) {
+    let r = upgrade ? await run('pipx', ['upgrade', pkg], PIP_TIMEOUT) : { ok: false, stderr: '' };
+    if (!r.ok) r = await run('pipx', ['install', spec], PIP_TIMEOUT);
+    if (r.ok || /already (seems to be )?installed/i.test(r.stdout + r.stderr)) return done('pipx');
+    tries.push(`pipx: ${pipWhy(r.stderr || r.stdout)}`);
+  }
+  const facts = await pyFacts();
+  if (facts.pip && pyVersionOk(facts.version, requires)) {
+    const r = await pipInstall([spec], { upgrade, facts });
+    if (r.ok.length) return done('pip, no seu usuário');
+    tries.push(`pip: ${r.failed[0][1]}`);
+  } else if (facts.pip) tries.push(`pip: o pacote pede Python ${requires} e o desta máquina é ${facts.version}`);
+  else if (!uvPath) tries.push(facts.version ? 'este Python não tem pip' : 'Python 3 não encontrado');
+  return { ok: false, why: tries.join(' · ') || 'nenhum instalador de Python disponível', hint };
 }
 
 async function installDeps(folders, includeOptional = false, opts = {}) {
   progress(4, 'Conferindo o que falta', 12);
   const before = await checkDeps(folders, opts);
   const want = before.deps.filter((d) => !d.ok && (includeOptional || !d.optional));
-  const pip = before.hasPip ? [...new Set(want.filter((d) => d.how === 'pip').map((d) => (d.spec && PIP_SPEC_RE.test(d.spec) ? d.spec : d.pip)))].filter((x) => DEP_NAME_RE.test(x) || PIP_SPEC_RE.test(x)) : [];
+  const pip = before.hasPip ? [...new Set(want.filter((d) => d.how === 'pip').map((d) => (d.spec && PIP_SPEC_RE.test(d.spec) ? d.spec : d.pip)))].filter((x) => PIP_SPEC_RE.test(String(x))) : [];
   const npm = [...new Set(want.filter((d) => d.how === 'npm').map((d) => d.npm))].filter((x) => DEP_NAME_RE.test(x));
   const brew = [...new Set(want.filter((d) => d.how === 'brew' && !d.brewCask).map((d) => d.brew))].filter((x) => DEP_NAME_RE.test(x));
   const casks = [...new Set(want.filter((d) => d.how === 'brew' && d.brewCask).map((d) => d.brew))].filter((x) => DEP_NAME_RE.test(x));
+  const tools = want.filter((d) => d.how === 'pytool');
   const log = [];
   const tail = (r, fallback) => r.stderr.split('\n').filter(Boolean).pop() || fallback;
   // uma fatia da barra para cada gerenciador que tem algo a instalar
-  const stages = [brew, casks, pip, npm].filter((l) => l.length).length || 1;
+  const stages = [brew, casks, tools, pip, npm].filter((l) => l.length).length || 1;
   let stage = 0;
   const stageOf = (what, list) => { progress(12 + (80 * stage) / stages, `${what}: instalando ${list.join(', ')}`, 12 + (80 * ++stage) / stages); };
   for (const [list, args, what] of [[brew, ['install'], 'Homebrew'], [casks, ['install', '--cask'], 'Homebrew (apps)']]) {
@@ -1568,16 +2148,19 @@ async function installDeps(folders, includeOptional = false, opts = {}) {
     const r = await run('brew', [...args, ...list], 30 * 60 * 1000, { HOMEBREW_NO_AUTO_UPDATE: '1' });
     log.push(r.ok ? `${what}: ${list.join(', ')} instalados` : `${what}: falhou (${tail(r, 'brew indisponível')})`);
   }
+  if (tools.length) {
+    stageOf('Ferramenta Python', tools.map((d) => d.name));
+    for (const d of tools) {
+      const r = await installPyTool(d.spec && PIP_SPEC_RE.test(d.spec) ? d.spec : d.pip, { requires: d.requires || '', bootstrap: Boolean(d.needsUv) });
+      log.push(r.ok ? `Python: ferramenta ${d.name} instalada (${r.via})` : `Python: falhou ao instalar a ferramenta ${d.name} (${r.why}). Para instalar à parte: ${r.hint}`);
+    }
+  }
   if (pip.length) {
     stageOf('Python (pip)', pip);
-    const venv = (await pyRun(['-c', 'import sys; sys.exit(sys.prefix == sys.base_prefix)'], 10000)).ok;
-    let r = await pyRun(['-m', 'pip', 'install', ...(venv ? [] : ['--user']), '--quiet', ...pip], 10 * 60 * 1000);
-    // PEP 668: Python do sistema recusa pip --user sem esta flag.
-    if (!r.ok && !venv && /externally-managed/i.test(r.stderr)) {
-      log.push('Python do sistema é gerenciado (PEP 668): instalando só no seu usuário com --break-system-packages');
-      r = await pyRun(['-m', 'pip', 'install', '--user', '--quiet', '--break-system-packages', ...pip], 10 * 60 * 1000);
-    }
-    log.push(r.ok ? `Python: ${pip.join(', ')} instalados` : `Python: falhou (${r.stderr.split('\n').filter(Boolean).pop() || 'pip indisponível'})`);
+    const r = await pipInstall(pip);
+    log.push(...r.notes);
+    if (r.ok.length) log.push(`Python: ${r.ok.join(', ')} instalados`);
+    for (const [p, why] of r.failed) log.push(`Python: falhou ao instalar ${p} (${why})`);
   }
   if (npm.length) {
     stageOf('Node (npm)', npm);
@@ -1689,21 +2272,7 @@ function replaceSkillDir(srcDir, dest, sourceLine, fromRepo = false) {
   const fresh = path.join(parent, `.${base}.hub-new-${process.pid}`);
   const old = path.join(parent, `.${base}.hub-old-${process.pid}`);
   rmSafe(fresh);
-  // Links só podem apontar para dentro da própria skill: um repositório não alcança arquivos do usuário.
-  const filter = (f) => {
-    if (path.relative(srcDir, f).split(path.sep).includes('.git')) return false;
-    if (fromRepo && ['.hub-source', INSTR_SKILL_MARK].includes(path.basename(f))) return false;
-    let st;
-    try { st = fs.lstatSync(f); } catch { return false; }
-    return !st.isSymbolicLink() || linkStaysInside(srcDir, f);
-  };
-  try { fs.cpSync(srcDir, fresh, { recursive: true, verbatimSymlinks: true, filter }); }
-  catch (e) {
-    // Windows sem modo de desenvolvedor não cria links: copia o conteúdo
-    if (e.code !== 'EPERM') throw e;
-    rmSafe(fresh);
-    fs.cpSync(srcDir, fresh, { recursive: true, dereference: true, filter });
-  }
+  copySkillTree(srcDir, fresh, fromRepo);
   if (sourceLine) writeSourceLine(fresh, `${sourceLine}sha256:${dirHash(fresh)}\n`);
   const existed = fs.existsSync(real);
   if (existed) renameSafe(real, old);
@@ -1779,6 +2348,22 @@ async function npmLocal(skillDir, folder) {
   return log;
 }
 
+// Depois de trocar o conteúdo de uma skill: a ferramenta Python de que ela depende acompanha, porque o SKILL.md novo
+// pode usar comandos que só existem na versão nova. Skills do catálogo têm as dependências curadas e ficam de fora.
+async function upgradeSkillTools(folder, sk, src) {
+  const cat = catalogItemOf(folder);
+  if (cat && sameRepo(cat.source, src.label)) return [];
+  const home = sk.home || sk.dir;
+  const tools = inferDeps(sk.dir, folder, { project: projectOf(src.dir, home), embedded: Boolean(sk.embedded), pyVersion: await pyVersion() }).deps.filter((d) => d.type === 'pytool');
+  const log = [];
+  for (const d of tools) {
+    progress(96, `Atualizando a ferramenta ${d.name}`, 99);
+    const r = await installPyTool(d.spec && PIP_SPEC_RE.test(d.spec) ? d.spec : d.pip, { requires: d.requires || '', upgrade: true });
+    log.push(r.ok ? `${folder}: ferramenta ${d.name} na versão mais recente (${r.via})` : `${folder}: falhou ao atualizar a ferramenta ${d.name} (${r.why}). Para atualizar à parte: ${r.hint}`);
+  }
+  return log;
+}
+
 // force: sobrescreve mesmo que a skill tenha sido editada na máquina depois de instalada.
 async function updateSkill(body) {
   const folder = String(body.skill || '');
@@ -1792,7 +2377,7 @@ async function updateSkill(body) {
   const sk = src.skills.find((x) => x.folder === folder);
   if (!sk) throw new Error(`não encontrei a skill "${folder}" em ${src.label}`);
   progress(60, `Comparando ${folder} com a versão nova`, 95);
-  const relPath = path.relative(src.dir, sk.dir);
+  const relPath = path.relative(src.dir, sk.home || sk.dir);
   // Skills do npx skills já têm a origem no lock; não gravamos nada dentro delas.
   let npxDir = readSkillLock().skills?.[folder] ? path.join(HOME, '.agents', 'skills') : null;
   try { if (npxDir) npxDir = fs.realpathSync(npxDir); } catch {}
@@ -1805,7 +2390,9 @@ async function updateSkill(body) {
     if (seen.has(real)) { continue; }
     seen.add(real);
     const line = npxDir && path.dirname(real) === npxDir ? null : sourceLine;
-    if (dirEqual(sk.dir, real)) {
+    // skill com variante por agente: cada pasta é comparada e trocada pela variante do agente dela
+    const from = skillDirFor(sk, t.tool);
+    if (dirEqual(from, real)) {
       unchanged.push(t.display);
       // conferida agora: a versão gravada acompanha o repositório, para a checagem de novidades não acusar de novo
       if (line && (lexists(path.join(real, '.hub-source')) || body.source)) writeSourceLine(real, `${line}sha256:${dirHash(real)}\n`);
@@ -1814,11 +2401,14 @@ async function updateSkill(body) {
     // editada na máquina depois de instalada (a impressão digital gravada não bate mais): só troca com confirmação
     const was = storedHash(real);
     if (was && !body.force && dirHash(real) !== was) { modified.push(t.display); continue; }
-    const at = replaceSkillDir(sk.dir, dest, line, true);
+    const at = replaceSkillDir(from, dest, line, true);
     updated.push(t.display);
     local.push(...(await npmLocal(at, folder)));
   }
-  if (updated.length) await touchSkillLock(folder, src, relPath);
+  if (updated.length) {
+    await touchSkillLock(folder, src, relPath);
+    local.push(...(await upgradeSkillTools(folder, sk, src)));
+  }
   skillsCheckCache = null;
   return { skill: folder, source: src.stored, commit: src.commit, date: src.date, updated, unchanged, modified, local };
 }
@@ -1890,14 +2480,17 @@ async function installSkills(body) {
   const local = [], npmDone = new Set();
   for (const sk of chosen) {
     if (!SKILL_NAME_RE.test(sk.folder)) throw new Error(`nome de skill inválido: ${sk.folder}`);
+    // instalar por cima de uma cópia que já existia é uma atualização: a ferramenta Python da skill acompanha
+    const had = targets.some((t) => lexists(path.join(t.dir, sk.folder)));
     for (const t of targets) {
       const total = chosen.length * targets.length;
       progress(55 + (40 * done) / total, `Instalando ${sk.folder} em ${t.display} (${done + 1} de ${total})`, 55 + (40 * ++done) / total);
       // a cópia é síncrona: cede a vez para a interface conseguir ler o progresso
       await new Promise((res) => setImmediate(res));
-      const at = replaceSkillDir(sk.dir, path.join(t.dir, sk.folder), `${src.stored}\n${src.commit} · ${src.date}\n`, true);
+      const at = replaceSkillDir(skillDirFor(sk, t.tool), path.join(t.dir, sk.folder), `${src.stored}\n${src.commit} · ${src.date}\n`, true);
       if (!npmDone.has(at)) { npmDone.add(at); local.push(...(await npmLocal(at, sk.folder))); }
     }
+    if (had) local.push(...(await upgradeSkillTools(sk.folder, sk, src)));
   }
   skillsCheckCache = null;
   return { installed: chosen.map((sk) => sk.folder), targets: targets.map((t) => t.display), commit: src.commit, date: src.date, source: src.stored, local };
@@ -1976,15 +2569,19 @@ const NPM_ENOTEMPTY = /ENOTEMPTY|code ENOTEMPTY|errno -39|directory not empty, r
 
 // Pastas onde as CLIs costumam cair e que nem sempre estão no PATH de quem abriu o hub (terminal antigo, serviço, IDE).
 function knownBinDirs() {
+  // executáveis do "pip install --user": cada versão do Python tem a sua pasta, quase nunca no PATH (no Linux é ~/.local/bin)
+  const pyUser = (base, sub) => { try { return fs.readdirSync(base).filter((n) => /^(Python)?\d/i.test(n)).map((n) => path.join(base, n, sub)); } catch { return []; } };
   if (IS_WIN) {
     const local = process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local');
     const roaming = process.env.APPDATA || path.join(HOME, 'AppData', 'Roaming');
-    return [path.join(HOME, '.local', 'bin'), path.join(local, 'Microsoft', 'WinGet', 'Links'), path.join(roaming, 'npm')];
+    return [path.join(HOME, '.local', 'bin'), path.join(local, 'Microsoft', 'WinGet', 'Links'), path.join(roaming, 'npm'), ...pyUser(path.join(roaming, 'Python'), 'Scripts')];
   }
-  return [path.join(HOME, '.local', 'bin'), ...(IS_MAC ? ['/opt/homebrew/bin'] : ['/home/linuxbrew/.linuxbrew/bin']), '/usr/local/bin'];
+  return [path.join(HOME, '.local', 'bin'), ...(IS_MAC ? ['/opt/homebrew/bin'] : ['/home/linuxbrew/.linuxbrew/bin']), '/usr/local/bin', ...(IS_MAC ? pyUser(path.join(HOME, 'Library', 'Python'), 'bin') : [])];
 }
 // Acrescenta ao fim do PATH deste processo (nunca na frente: não muda qual executável já vinha primeiro).
 function addToPath(dirs) {
+  // testes: o PATH fica exatamente o que o teste montou, para nenhum programa de verdade da máquina ser chamado
+  if (process.env.HUB_FIXED_PATH) return;
   const key = (d) => { const r = path.resolve(d); return IS_WIN ? r.toLowerCase().replace(/\\+$/, '') : r; };
   const cur = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
   const seen = new Set(cur.map(key));
@@ -4029,7 +4626,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { source: src.label, ref: src.ref, branch: src.branch, commit: src.commit, date: src.date, checkedAt: new Date().toISOString(),
         license: firstSkill ? licenseOf(firstSkill.dir) : '',
         readme: folders.length ? readmeExcerpt(src, folders) : null,
-        skills: src.skills.map(({ name, description, folder, files, license, compatibility, path: where, also }) => ({ name, description, folder, files, license: license || '', compatibility: compatibility || '', path: where || '', also: also || [] })) });
+        skills: src.skills.map(({ name, description, folder, files, license, compatibility, path: where, also, note }) => ({ name, description, folder, files, license: license || '', compatibility: compatibility || '', path: where || '', also: also || [], note: note || '' })) });
     }
     if (req.method === 'POST' && url.pathname === '/api/skills/install') {
       const body = await readBody(req);
@@ -4194,10 +4791,17 @@ if (require.main !== module) {
     loginStatus, codexLogin, geminiLogin, copilotLogin, claudeRelogin, detectAccounts,
     skillTargets, skillMeta, fetchSource, parseSource, installSkills, updateSkill, copySkill, removeSkill, checkDeps, installDeps, readSkillLock,
     inferDeps, depsFor, catalogItemOf, codeLines, skillsCheck, updateAllSkills, dirHash, sourceRef, npmLocal,
+    findSkills, skillAt, skillDirFor, projectOf, pyProject, pyImportsOf, markerOk, pyVersionOk, pipWhy, pipInstall, installPyTool, AUTO_HOW,
     npmLocalBlock, npmRegistrySpec, sysPkgOk, replaceSkillDir, linkStaysInside, peerUidFrom,
     bedrockCheck, bedrockApply, modelsCheck, modelsApply, MODEL_SOURCES, toolInventory, versions, installed,
     instrTargets, instructionsState, saveInstruction, removeInstruction, scanGarbage, cleanGarbage,
-    dropSources: () => { for (const entry of [...sourceCache.values(), ...retired]) dropSource(entry); sourceCache.clear(); retired.clear(); },
+    dropSources: () => {
+      for (const entry of [...sourceCache.values(), ...retired]) dropSource(entry);
+      sourceCache.clear(); retired.clear();
+      // montagens de clones que não passaram pelo cache
+      for (const stage of stages.values()) fs.rmSync(stage.dir, { recursive: true, force: true });
+      stages.clear();
+    },
   };
 } else if (process.argv[2] === 'bedrock-models') {
   (async () => {

@@ -34,9 +34,13 @@ function gradient(text) {
   return B + ch.map((c, i) => `\x1b[38;5;${GRAD[Math.floor((i * GRAD.length) / ch.length)]}m${c}`).join('') + N;
 }
 
-const out = (s) => process.stdout.write(s);
-const echo = (s = '') => process.stdout.write(s + '\n');
-const warnErr = (s) => process.stderr.write(s + '\n');
+// Última tela pintada com paint(): é o que o redimensionamento redesenha. Só vale enquanto essa tela
+// é o que está à mostra: qualquer outra escrita (ou uma CLI aberta) a invalida, senão redimensionar a
+// janela pintaria o menu por cima da CLI ou da saída de um comando.
+let LAST_PAINT = null;
+const out = (s) => { LAST_PAINT = null; return process.stdout.write(s); };
+const echo = (s = '') => out(s + '\n');
+const warnErr = (s) => { LAST_PAINT = null; return process.stderr.write(s + '\n'); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function pad(text, w) {
@@ -209,7 +213,8 @@ function takeChar() {
 function cursor(mode) {
   if (!TTY_OUT) return;
   CURSOR_HIDDEN = mode === 'civis';
-  out(CURSOR_HIDDEN ? '\x1b[?25l' : '\x1b[?25h');
+  // direto no stdout: mostrar/esconder o cursor não tira a tela pintada de cena
+  process.stdout.write(CURSOR_HIDDEN ? '\x1b[?25l' : '\x1b[?25h');
 }
 function restoreTerminal() {
   if (TTY_OUT && CURSOR_HIDDEN) { process.stdout.write('\x1b[?25h'); CURSOR_HIDDEN = false; }
@@ -264,6 +269,7 @@ async function readCharWithin(ms) {
   return c === '\x03' ? ctrlC() : c;
 }
 async function readLine(prompt, silent = false) {
+  LAST_PAINT = null;
   if (TTY_IN) process.stderr.write(prompt);
   inputOn(TTY_IN);
   IN.intr = false;
@@ -336,9 +342,8 @@ function fitRows(s) {
   return lines.slice(start, start + rows).join('\n');
 }
 const paintText = (s) => '\x1b[H' + fitRows(s).replace(/\n/g, '\x1b[K\n') + '\x1b[K\x1b[J';
-let LAST_PAINT = null;
-const paint = (s) => { LAST_PAINT = s; out(paintText(s)); };
-if (TTY_OUT) process.stdout.on('resize', () => { if (LAST_PAINT !== null) out(paintText(LAST_PAINT)); });
+const paint = (s) => { LAST_PAINT = s; process.stdout.write(paintText(s)); };
+if (TTY_OUT) process.stdout.on('resize', () => { if (LAST_PAINT !== null && !CHILD) process.stdout.write(paintText(LAST_PAINT)); });
 
 function spawnFail(file, e) {
   warnErr(`hub: não consegui executar "${file}": ${e.code === 'ENOENT' ? 'comando não encontrado' : e.message}`);
@@ -347,6 +352,7 @@ function spawnFail(file, e) {
 async function runChild(file, argv, env, extra = {}) {
   inputOff();
   CHILD = true;
+  LAST_PAINT = null;
   try {
     return await new Promise((resolve) => {
       let done = false;
@@ -369,6 +375,7 @@ async function teeExec(line) {
   const [f, a, o] = lib.shellArgs(line);
   inputOff();
   CHILD = true;
+  LAST_PAINT = null;
   try {
     return await new Promise((resolve) => {
       let so = '', se = '', done = false;
@@ -669,12 +676,13 @@ async function skillInstallDeps(folders, source = '') {
     const inferred = Object.values(r.origin || {}).includes('inferida');
     out(`    ${GRAY}${inferred ? 'nenhuma dependência encontrada nos arquivos da skill' : 'nenhuma dependência extra'}${N}\n`);
   } else {
-    if (r.inferred) out(`    ${GRAY}deduzidas dos arquivos da skill (manifestos, scripts e SKILL.md)${N}\n`);
+    if (r.inferred) out(`    ${GRAY}deduzidas dos arquivos da skill (manifestos, scripts, SKILL.md e o pacote de que ela faz parte)${N}\n`);
     for (const d of r.deps) {
       const why = d.inferred && d.evidence && d.evidence.length ? ` ${GRAY}· ${plain(d.evidence[0]).slice(0, 70)}${N}` : '';
       if (d.ok) out(`    ${GREEN}✓${N} ${d.label}${why}\n`);
       else if (d.optional) out(`    ${GRAY}○${N} ${d.label} ${GRAY}(opcional)${N}${why}\n`);
       else out(`    ${RED}✗${N} ${d.label}${why}\n`);
+      if (!d.ok && !d.optional && d.note) out(`      ${GRAY}${plain(d.note)}${N}\n`);
     }
   }
   const autoSteps = steps.filter((s) => s.kind === 'auto'), manualSteps = steps.filter((s) => s.kind !== 'auto');
@@ -693,7 +701,7 @@ async function skillInstallDeps(folders, source = '') {
             : `${d.label} (pelo gerenciador de pacotes do seu sistema${d.apt ? `, pacote parecido com ${d.apt}` : ''})`;
     out(`    ${YEL}!${N} instale à parte: ${why}\n`);
   }
-  const viaLib = need.some((d) => ['pip', 'npm', 'brew'].includes(d.how));
+  const viaLib = need.some((d) => lib.AUTO_HOW.includes(d.how));
   const sysArgs = Array.isArray(r.sysArgs) ? r.sysArgs : [];
   const sysRuns = Array.isArray(r.sysRuns) && r.sysRuns.length ? r.sysRuns : sysArgs.length ? [sysArgs] : [];
   const npmArgs = Array.isArray(r.npmArgs) ? r.npmArgs : [];
@@ -724,7 +732,7 @@ async function skillInstallDeps(folders, source = '') {
     if ((await runCli('sudo', npmArgs, process.env)) === 0) out(`  ${GREEN}✓${N} pacotes Node instalados\n`);
     else out(`  ${RED}✗${N} não consegui instalar os pacotes Node\n`);
   }
-  if (viaLib || r.deps.some((d) => !d.ok && !d.optional && d.how === 'pip')) {
+  if (viaLib || r.deps.some((d) => !d.ok && !d.optional && lib.AUTO_HOW.includes(d.how))) {
     let res;
     try { res = await spinRun('instalando as dependências…', lib.installDeps(folders, false, opts)); } catch (e) { res = { log: [`falhou: ${e.message}`] }; }
     for (const l of res.log || []) out(`  ${/falhou/.test(l) ? `${RED}✗` : `${GREEN}✓`}${N} ${plain(l)}\n`);
@@ -819,8 +827,7 @@ async function installSkillFrom(src, T) {
     let fetched;
     try { fetched = await lib.fetchSource(src, { fresh: true }); } catch (e) {
       if (/^não consegui baixar/.test(e.message)) echo(`${RED}✗${N} não consegui baixar ${repo} (o repositório existe e é público?)`);
-      else if (/^nenhuma skill/.test(e.message)) echo(`${RED}✗${N} nenhuma skill (SKILL.md) encontrada em ${repo}${parsed.sub ? `/${parsed.sub}` : ''}`);
-      else echo(`${RED}✗${N} ${e.message}`);
+      else echo(`${RED}✗${N} ${plain(e.message)}`);
       return 1;
     }
     let found = [...fetched.skills].sort((x, y) => (x.dir < y.dir ? -1 : x.dir > y.dir ? 1 : 0));
@@ -844,6 +851,7 @@ async function installSkillFrom(src, T) {
     echo(`  encontrada(s): ${B}${found.map((s) => plain(s.folder) + ' ').join('')}${N}`);
     echo(`  versão:        ${fetched.commit} · ${fetched.date} ${GRAY}(a mais recente${fetched.branch ? ` da branch ${fetched.branch}` : ''}, baixada agora)${N}`);
     for (const sk of found) if (sk.also && sk.also.length) echo(`  ${YEL}!${N} ${plain(sk.folder)} vem de ${plain(sk.path)}; há outra pasta com o mesmo nome (${sk.also.map(plain).join(', ')}): para instalar aquela, cole o link dela`);
+    for (const sk of found) if (sk.note) echo(`  ${GRAY}${found.length > 1 ? `${plain(sk.folder)}: ` : ''}${plain(sk.note)}${N}`);
     const licenses = [...new Set(found.map((s) => plain(String(s.license || '')).trim()).filter(Boolean))];
     if (licenses.length) echo(`  licença:       ${licenses.join(', ')} ${GRAY}(declarada no SKILL.md)${N}`);
     echo(`  instalar em:   ${T.map((t) => t.label).join(' · ')}`);
